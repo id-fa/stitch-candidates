@@ -315,6 +315,269 @@ def _template_match_numpy(img: np.ndarray, template: np.ndarray) -> Tuple[float,
     return best_val, best_loc
 
 
+def find_template_candidates(rgb: np.ndarray, n_candidates: int = 20,
+                              exclude_center: bool = True,
+                              template_size: Tuple[int, int] = (150, 150),
+                              step: int = 40) -> List[Tuple[float, int, int, int, int]]:
+    """
+    テンプレート候補領域を探索し、スコア付きで返す。
+
+    Returns: [(score, y1, y2, x1, x2), ...] スコア降順
+    """
+    gray = to_gray_f32(rgb)
+    edge = sobel_edge(gray)
+
+    h, w = edge.shape
+    template_h, template_w = template_size
+
+    # マスク: 中央のテキスト領域を除外
+    mask = np.ones_like(edge)
+    if exclude_center:
+        cx = w // 2
+        mask[:, int(cx - w * 0.30):int(cx + w * 0.30)] = 0
+
+    # 上下端を除外（画面外に出やすい）
+    margin_y = int(h * 0.10)
+    mask[:margin_y, :] = 0
+    mask[-margin_y:, :] = 0
+
+    candidates = []
+    for y in range(0, h - template_h, step):
+        for x in range(0, w - template_w, step):
+            region_mask = mask[y:y + template_h, x:x + template_w]
+            if region_mask.mean() < 0.8:
+                continue
+            region_edge = edge[y:y + template_h, x:x + template_w]
+            score = float(region_edge.mean())
+            # 左右端にボーナス
+            if x < w * 0.25 or x > w * 0.75:
+                score *= 1.3
+            candidates.append((score, y, y + template_h, x, x + template_w))
+
+    # スコア順にソート
+    candidates.sort(reverse=True)
+
+    # 重複を避けて選択
+    selected = []
+    min_dist = 80
+    for score, y1, y2, x1, x2 in candidates:
+        too_close = False
+        for _, sy1, sy2, sx1, sx2 in selected:
+            cy1, cx1 = (y1 + y2) // 2, (x1 + x2) // 2
+            cy2, cx2 = (sy1 + sy2) // 2, (sx1 + sx2) // 2
+            dist = ((cy1 - cy2) ** 2 + (cx1 - cx2) ** 2) ** 0.5
+            if dist < min_dist:
+                too_close = True
+                break
+        if not too_close:
+            selected.append((score, y1, y2, x1, x2))
+            if len(selected) >= n_candidates:
+                break
+
+    return selected
+
+
+def evaluate_template_candidate(frames_rgb: List[np.ndarray],
+                                 region: Tuple[int, int, int, int],
+                                 max_frames: int = None) -> Dict:
+    """
+    1つのテンプレート候補を全フレームで追跡検証する。
+
+    Returns: {
+        'region': (y1, y2, x1, x2),
+        'mean_score': float,
+        'min_score': float,
+        'std_score': float,
+        'lost_ratio': float,  # スコア < 0.7 の割合
+        'dy_std': float,      # dy推定のばらつき
+        'stability': float,   # 総合安定性スコア (0-1)
+    }
+    """
+    y1, y2, x1, x2 = region
+    n_frames = len(frames_rgb)
+    if max_frames and n_frames > max_frames:
+        # サンプリング
+        indices = np.linspace(0, n_frames - 1, max_frames, dtype=int)
+        frames_sample = [frames_rgb[i] for i in indices]
+    else:
+        frames_sample = frames_rgb
+
+    scores = []
+    dys = []
+    offsets = [(0, 0)]
+
+    for i in range(1, len(frames_sample)):
+        prev_rgb = frames_sample[i - 1]
+        next_rgb = frames_sample[i]
+
+        dy, score, new_offsets = template_match_dy(
+            prev_rgb, next_rgb,
+            [(y1, y2, x1, x2)],
+            offsets
+        )
+        offsets = new_offsets
+        scores.append(score)
+        dys.append(dy)
+
+    if not scores:
+        return {
+            'region': region,
+            'mean_score': 0.0,
+            'min_score': 0.0,
+            'std_score': 0.0,
+            'lost_ratio': 1.0,
+            'dy_std': 0.0,
+            'stability': 0.0,
+        }
+
+    mean_score = float(np.mean(scores))
+    min_score = float(np.min(scores))
+    std_score = float(np.std(scores))
+    lost_ratio = sum(1 for s in scores if s < 0.7) / len(scores)
+
+    nonzero_dys = [d for d in dys if d != 0]
+    dy_std = float(np.std(nonzero_dys)) if len(nonzero_dys) > 1 else 0.0
+
+    # 総合安定性スコア (0-1)
+    # - mean_score が高いほど良い
+    # - lost_ratio が低いほど良い
+    # - dy_std が低いほど良い（一定の動きを期待）
+    stability = mean_score * (1 - lost_ratio) * max(0, 1 - dy_std / 50)
+    stability = min(1.0, max(0.0, stability))
+
+    return {
+        'region': region,
+        'mean_score': mean_score,
+        'min_score': min_score,
+        'std_score': std_score,
+        'lost_ratio': lost_ratio,
+        'dy_std': dy_std,
+        'stability': stability,
+    }
+
+
+def visualize_template_candidates(rgb: np.ndarray,
+                                   candidates: List[Dict],
+                                   out_path: Path,
+                                   top_n: int = 10) -> None:
+    """
+    候補領域を可視化した画像を保存する。
+    """
+    img = rgb.copy()
+    h, w = img.shape[:2]
+
+    # 上位N件を描画
+    for rank, cand in enumerate(candidates[:top_n], 1):
+        y1, y2, x1, x2 = cand['region']
+        stability = cand['stability']
+
+        # 色: 安定性に応じて緑→黄→赤
+        if stability >= 0.7:
+            color = (0, 255, 0)  # 緑
+        elif stability >= 0.4:
+            color = (255, 255, 0)  # 黄
+        else:
+            color = (255, 0, 0)  # 赤
+
+        # 矩形を描画
+        thickness = 3 if rank <= 3 else 2
+        img[y1:y1 + thickness, x1:x2] = color
+        img[y2 - thickness:y2, x1:x2] = color
+        img[y1:y2, x1:x1 + thickness] = color
+        img[y1:y2, x2 - thickness:x2] = color
+
+        # ランク番号を左上に描画（簡易的に矩形で）
+        label_h, label_w = 20, 25
+        ly, lx = max(0, y1 - label_h), x1
+        img[ly:ly + label_h, lx:lx + label_w] = color
+
+    save_rgb(img, out_path)
+
+
+def suggest_templates_mode(frames_rgb: List[np.ndarray],
+                            out_dir: Path,
+                            n_candidates: int = 15,
+                            max_eval_frames: int = None) -> None:
+    """
+    テンプレート候補を探索・検証・可視化するモード。
+    """
+    print(f"\n[Template Suggestion Mode]")
+    print(f"  Analyzing {len(frames_rgb)} frames...")
+
+    # 1. 候補領域を探索
+    print(f"\n  Step 1: Finding candidate regions...")
+    first_frame = frames_rgb[0]
+    candidates_raw = find_template_candidates(first_frame, n_candidates=n_candidates)
+    print(f"    Found {len(candidates_raw)} candidates")
+
+    # 2. 各候補を全フレームで検証
+    print(f"\n  Step 2: Evaluating stability across all frames...")
+    candidates_evaluated = []
+    for i, (score, y1, y2, x1, x2) in enumerate(candidates_raw):
+        print(f"    [{i + 1}/{len(candidates_raw)}] Region y={y1},h={y2 - y1},x={x1},w={x2 - x1}...", end="", flush=True)
+        result = evaluate_template_candidate(
+            frames_rgb,
+            (y1, y2, x1, x2),
+            max_frames=max_eval_frames
+        )
+        result['edge_score'] = score
+        candidates_evaluated.append(result)
+        print(f" stability={result['stability']:.3f}")
+
+    # 3. 安定性でソート
+    candidates_evaluated.sort(key=lambda x: x['stability'], reverse=True)
+
+    # 4. 結果を出力
+    print(f"\n  Step 3: Results (sorted by stability)")
+    print("=" * 80)
+    print(f"{'Rank':<5} {'Stability':<10} {'Mean Score':<12} {'Lost %':<8} {'dy_std':<8} {'--template-region':<25}")
+    print("-" * 80)
+
+    for rank, cand in enumerate(candidates_evaluated[:10], 1):
+        y1, y2, x1, x2 = cand['region']
+        region_str = f'"{y1},{y2 - y1},{x1},{x2 - x1}"'
+        lost_pct = cand['lost_ratio'] * 100
+        print(f"{rank:<5} {cand['stability']:<10.3f} {cand['mean_score']:<12.3f} {lost_pct:<8.1f} {cand['dy_std']:<8.1f} {region_str:<25}")
+
+    print("=" * 80)
+
+    # ベスト候補のコマンド例
+    if candidates_evaluated:
+        best = candidates_evaluated[0]
+        y1, y2, x1, x2 = best['region']
+        print(f"\n  Recommended command:")
+        print(f'    --template-region "{y1},{y2 - y1},{x1},{x2 - x1}"')
+
+        if best['stability'] < 0.5:
+            print(f"\n  Warning: Best stability is low ({best['stability']:.3f})")
+            print(f"    Consider using --match-method phase instead")
+
+    # 5. 可視化画像を保存
+    vis_path = out_dir / "template_candidates.png"
+    visualize_template_candidates(first_frame, candidates_evaluated, vis_path)
+    print(f"\n  Visualization saved: {vis_path}")
+
+    # 6. 詳細CSVを保存
+    csv_path = out_dir / "template_candidates.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        import csv
+        writer = csv.writer(f)
+        writer.writerow(["rank", "y", "h", "x", "w", "stability", "mean_score", "min_score", "std_score", "lost_ratio", "dy_std", "edge_score"])
+        for rank, cand in enumerate(candidates_evaluated, 1):
+            y1, y2, x1, x2 = cand['region']
+            writer.writerow([
+                rank, y1, y2 - y1, x1, x2 - x1,
+                f"{cand['stability']:.4f}",
+                f"{cand['mean_score']:.4f}",
+                f"{cand['min_score']:.4f}",
+                f"{cand['std_score']:.4f}",
+                f"{cand['lost_ratio']:.4f}",
+                f"{cand['dy_std']:.2f}",
+                f"{cand['edge_score']:.4f}",
+            ])
+    print(f"  Details saved: {csv_path}")
+
+
 def select_template_regions(rgb: np.ndarray, n_templates: int = 8,
                             exclude_center: bool = True) -> List[Tuple[int, int, int, int]]:
     """
@@ -934,6 +1197,10 @@ def main() -> None:
   # 下方向スクロール（コンテンツが上に移動）のみ出力
   python video_strip_reconstruct.py --frames "frames/*.png" \\
     --strip-y 980 --strip-h 100 --scroll-dir down --out outdir
+
+  # テンプレート候補を探索（全フレームで安定性を検証）
+  python video_strip_reconstruct.py --frames "frames/*.png" \\
+    --strip-y 0 --strip-h 1080 --suggest-templates --out outdir
 """)
     ap.add_argument("--video", type=str, default="", help="Input video path (optional if --frames is used)")
     ap.add_argument("--frames", type=str, default="", help='Glob for extracted frames, e.g. "frames/*.png"')
@@ -968,6 +1235,10 @@ def main() -> None:
                     help="Use uniform dy per frame instead of estimation (e.g. -10 for 10px up per frame)")
     ap.add_argument("--template-region", type=str, default="",
                     help="Manual template region for template matching: 'y,h,x,w' (e.g. '350,150,750,150')")
+    ap.add_argument("--suggest-templates", action="store_true",
+                    help="Suggest best template regions by testing stability across all frames")
+    ap.add_argument("--suggest-n", type=int, default=15,
+                    help="Number of template candidates to evaluate (default: 15)")
 
     ap.add_argument("--ignore", action="append", default=[],
                     help='Ignore region (px): "top,(right|left|X),width,height"  e.g. "0,right,220,120"')
@@ -1010,6 +1281,11 @@ def main() -> None:
     print(f"Loading {len(frame_paths)} frames...")
     frames_rgb = [load_rgb(p) for p in frame_paths]
     full_h, full_w, _ = frames_rgb[0].shape
+
+    # Suggest templates mode
+    if args.suggest_templates:
+        suggest_templates_mode(frames_rgb, out_dir, n_candidates=args.suggest_n)
+        return
 
     # crop strips
     strips = [crop_strip(fr, y=args.strip_y, h=args.strip_h) for fr in frames_rgb]

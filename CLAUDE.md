@@ -137,6 +137,8 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 - `--dy-region "y,h"` - Region for dy estimation (e.g., "0,200" for top 200px)
 - `--uniform-dy` - Use uniform dy per frame (e.g., -50 for 50px up per frame)
 - `--template-region "y,h,x,w"` - Manual template region for template matching
+- `--suggest-templates` - Suggest best template regions by testing all frames
+- `--suggest-n` - Number of candidates to evaluate (default: 15)
 
 ### Output Files
 
@@ -160,6 +162,26 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 - `ncc_gray` - NCC on grayscale (slower but robust)
 - `ncc_edge` - NCC on edge map
 - `template` - Template matching with automatic tracking (best for scrolling backgrounds)
+
+### Template Suggestion Mode
+
+Find best `--template-region` candidates by testing tracking stability across all frames:
+
+```bash
+# Suggest template regions
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 0 --strip-h 1080 --suggest-templates --out outdir
+```
+
+Output:
+- `template_candidates.png` - Visualization with regions highlighted (green=stable, yellow=moderate, red=unstable)
+- `template_candidates.csv` - Detailed scores for each candidate
+- Terminal output with ranked list and copy-paste ready `--template-region` values
+
+Workflow:
+1. Run `--suggest-templates` to find stable regions
+2. Copy the recommended `--template-region` value
+3. Run with `--match-method template --template-region "y,h,x,w"`
 
 ### Scenarios and Recommended Approaches
 

@@ -111,6 +111,8 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 | `--no-edges` | エッジなしでdy推定 | Use grayscale (not edges) for dy estimation |
 | `--dy-region` | dy推定に使う領域 "y,h" | Region for dy estimation "y,h" |
 | `--template-region` | テンプレート領域 "y,h,x,w" | Manual template region "y,h,x,w" |
+| `--suggest-templates` | テンプレート候補を探索・評価 | Suggest best template regions |
+| `--suggest-n` | 評価する候補数 (default: 15) | Number of candidates to evaluate |
 | `--uniform-dy` | 均一なdy値を直接指定 | Use uniform dy per frame |
 
 ### テロップ除去設定 / Text Removal Settings
@@ -176,6 +178,77 @@ Multiple methods can be specified (comma-separated):
 python video_strip_reconstruct.py --frames "frames/*.png" \
   --strip-y 980 --strip-h 100 \
   --match-method phase,ncc_gray --out outdir
+```
+
+---
+
+## テンプレート候補探索 / Template Suggestion Mode
+
+`--suggest-templates` で最適な `--template-region` を自動探索できます。
+
+Use `--suggest-templates` to automatically find the best `--template-region`.
+
+### 使い方 / Usage
+
+```bash
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 0 --strip-h 1080 --suggest-templates --out outdir
+```
+
+### 処理の流れ / Process
+
+1. **候補探索**: 最初のフレームでエッジ強度ベースに候補領域を抽出
+2. **全フレーム検証**: 各候補を全フレームでテンプレートマッチング追跡
+3. **安定性評価**: 追跡スコア、失敗率、dyばらつきから総合評価
+4. **結果出力**: ランキングと可視化画像を出力
+
+1. **Candidate search**: Extract candidate regions based on edge strength from first frame
+2. **Full-frame validation**: Test each candidate with template matching across all frames
+3. **Stability evaluation**: Compute overall score from tracking score, loss rate, dy variance
+4. **Output results**: Output ranking and visualization image
+
+### 出力 / Output
+
+| ファイル | 説明 | Description |
+|---------|------|-------------|
+| `template_candidates.png` | 候補領域の可視化（緑=安定、黄=中程度、赤=不安定） | Visualization (green=stable, yellow=moderate, red=unstable) |
+| `template_candidates.csv` | 各候補の詳細スコア | Detailed scores for each candidate |
+
+### ターミナル出力例 / Terminal Output Example
+
+```
+================================================================================
+Rank  Stability  Mean Score   Lost %   dy_std   --template-region
+--------------------------------------------------------------------------------
+1     0.892      0.945        2.1      3.2      "350,150,50,150"
+2     0.871      0.932        3.5      4.1      "400,150,1700,150"
+3     0.654      0.876        8.2      5.8      "200,150,100,150"
+================================================================================
+
+  Recommended command:
+    --template-region "350,150,50,150"
+```
+
+### 評価指標 / Evaluation Metrics
+
+| 指標 | 説明 | Description |
+|-----|------|-------------|
+| `stability` | 総合安定性スコア (0-1) | Overall stability score |
+| `mean_score` | 平均マッチングスコア | Average matching score |
+| `lost_ratio` | 追跡失敗率（スコア<0.7の割合） | Tracking loss rate (score < 0.7) |
+| `dy_std` | dy推定値の標準偏差 | Standard deviation of dy estimates |
+
+### 推奨ワークフロー / Recommended Workflow
+
+```bash
+# 1. テンプレート候補を探索
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 0 --strip-h 1080 --suggest-templates --out outdir
+
+# 2. 推奨されたtemplate-regionで実行
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 0 --strip-h 1080 --match-method template \
+  --template-region "350,150,50,150" --edge-thr 0.35 --out outdir
 ```
 
 ---
@@ -270,6 +343,8 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 | `recon_{method}_dy.png` | 特定手法での dy結果 | dy result from specific method |
 | `recon_static_median.png` | static-bgモードの結果 | Result from static-bg mode |
 | `debug_positions.csv` | 各フレームの推定情報 | Estimation info per frame |
+| `template_candidates.png` | テンプレート候補の可視化 | Template candidates visualization |
+| `template_candidates.csv` | テンプレート候補の詳細 | Template candidates details |
 
 ### debug_positions.csv の内容 / Contents
 
@@ -391,6 +466,9 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 - **fpsを調整**: 高すぎると逆効果。2-4から開始
 - **Adjust fps**: Too high can be counterproductive. Start with 2-4
 
+- **テンプレート候補を探索**: `--suggest-templates` で安定した領域を見つける
+- **Find template candidates**: Use `--suggest-templates` to find stable regions
+
 - **テンプレート位置を調整**: 特徴的で長く画面に残る領域を選ぶ
 - **Adjust template position**: Choose distinctive regions that stay visible longer
 
@@ -474,9 +552,10 @@ After execution, automatically analyzes `debug_positions.csv` and shows suggesti
 
 ### テンプレート追跡が失敗する / Template tracking fails
 
-1. `--template-region` で特徴的な領域を手動指定
-2. fpsを上げてフレーム数を増やす
-3. 追跡対象が画面内に長く留まる領域を選ぶ
+1. `--suggest-templates` で安定した領域を探索
+2. `--template-region` で特徴的な領域を手動指定
+3. fpsを下げる（小さいdyは誤検出しやすい）
+4. 追跡対象が画面内に長く留まる領域を選ぶ
 
 ### テキストが残る / Text remains in result
 
