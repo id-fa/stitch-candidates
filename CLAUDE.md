@@ -181,8 +181,17 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 
 - Phase correlation may fail with repetitive patterns (e.g., floral decorations)
 - Template tracking loses target when feature exits frame (interpolation helps)
-- Higher fps improves tracking accuracy (more frames = smaller dy per frame)
+- **Higher fps does NOT always improve accuracy** - can cause more tracking errors
 - Accumulated small errors in dy estimation can cause visible artifacts
+
+### FPS vs Accuracy Trade-off
+
+| fps | Pros | Cons |
+|-----|------|------|
+| Low (2-4) | Larger dy per frame, easier to track | Fewer frames, interpolation needed |
+| High (10+) | More frames | Small dy causes tracking errors, false matches |
+
+**Recommendation:** Start with fps=2-4, check results, adjust as needed
 
 ### Workflow for Difficult Cases
 

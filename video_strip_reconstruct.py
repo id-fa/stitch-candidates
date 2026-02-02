@@ -786,6 +786,107 @@ def write_positions_csv(paths: List[Path], dys: List[int], peaks: List[float],
 # Main
 # -------------------------
 
+def analyze_and_suggest(dys: List[int], peaks: List[float], frame_paths: List[Path],
+                        method: str, fps: float) -> None:
+    """
+    debug_positions.csv の内容を分析し、改善のためのパラメータを提案する。
+    """
+    n = len(dys)
+    if n < 2:
+        return
+
+    # 統計計算
+    nonzero_dys = [d for d in dys if d != 0]
+    zero_count = sum(1 for d in dys if d == 0)
+    zero_ratio = zero_count / n
+
+    valid_peaks = [p for p in peaks if p > 0]
+    low_score_count = sum(1 for p in peaks if 0 < p < 0.7)
+
+    if nonzero_dys:
+        dy_mean = np.mean(nonzero_dys)
+        dy_std = np.std(nonzero_dys)
+        dy_median = np.median(nonzero_dys)
+    else:
+        dy_mean = dy_std = dy_median = 0
+
+    total_movement = abs(sum(dys))
+
+    print("\n" + "="*60)
+    print("[Analysis Results]")
+    print("="*60)
+    print(f"  Frames: {n+1}")
+    print(f"  Total movement: {total_movement}px")
+    print(f"  dy mean: {dy_mean:.1f}px (std: {dy_std:.1f})")
+    print(f"  Zero dy ratio: {zero_ratio*100:.1f}% ({zero_count}/{n})")
+    print(f"  Low score ratio: {low_score_count}/{n}")
+
+    # 問題検出と提案
+    suggestions = []
+
+    # Many dy=0
+    if zero_ratio > 0.2:
+        suggestions.append({
+            'issue': 'Many dy=0 (tracking loss)',
+            'suggestions': [
+                f'Lower fps (current: {fps} -> suggest: {max(1, fps/2):.1f})',
+                '--template-region to manually specify distinctive region',
+                f'Try --uniform-dy {int(dy_median) if dy_median else "?"}',
+            ]
+        })
+
+    # Unstable dy estimation
+    if dy_std > abs(dy_mean) * 0.5 and abs(dy_mean) > 5:
+        suggestions.append({
+            'issue': 'Unstable dy estimation',
+            'suggestions': [
+                'Try --match-method phase (may be more stable than template)',
+                '--template-region to specify stable region',
+                f'Try --uniform-dy {int(dy_median)}',
+            ]
+        })
+
+    # Low matching scores
+    if low_score_count > n * 0.3:
+        suggestions.append({
+            'issue': 'Low matching scores',
+            'suggestions': [
+                'Change template region (choose more distinctive area)',
+                '--ignore to exclude problematic regions',
+                'Compare with --match-method phase,template',
+            ]
+        })
+
+    # Low total movement
+    expected_movement = abs(dy_median * n) if dy_median else 0
+    if expected_movement > 0 and total_movement < expected_movement * 0.7:
+        suggestions.append({
+            'issue': f'Low total movement (expected: ~{int(expected_movement)}px)',
+            'suggestions': [
+                'Manually interpolate dy=0 sections',
+                f'Try --uniform-dy {int(dy_median)}',
+            ]
+        })
+
+    if suggestions:
+        print("\n[Suggestions]")
+        for i, s in enumerate(suggestions, 1):
+            print(f"\n  {i}. {s['issue']}")
+            for suggestion in s['suggestions']:
+                print(f"     -> {suggestion}")
+    else:
+        print("\n  OK: No issues detected")
+
+    # Recommended command
+    if nonzero_dys and (zero_ratio > 0.1 or dy_std > abs(dy_mean) * 0.3):
+        print("\n[Recommended command]")
+        print(f"  python video_strip_reconstruct.py --frames \"...\" \\")
+        print(f"    --strip-y 0 --strip-h 1080 \\")
+        print(f"    --uniform-dy {int(-abs(dy_median))} --edge-thr 0.35 --out outdir")
+
+    print("="*60 + "\n")
+
+
 def show_diagnostics(dys: List[int], peaks: List[float], frame_paths: List[Path],
                      min_peak: float) -> None:
     """Show diagnostic info for unreliable dy estimates."""
@@ -1026,6 +1127,9 @@ def main() -> None:
     # Show diagnostics if min-peak is set
     if args.min_peak > 0:
         show_diagnostics(dys, peaks, frame_paths, args.min_peak)
+
+    # Analyze results and suggest improvements
+    analyze_and_suggest(dys, peaks, frame_paths, primary_method, args.fps)
 
     # two candidate position sequences: sum(dy) and sum(-dy)
     pos_dy = [0]

@@ -371,10 +371,25 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 - **累積誤差**: dyの小さな誤差が累積して画質劣化の原因になる
 - **Accumulated errors**: Small dy errors accumulate and cause quality degradation
 
+### fpsと精度のトレードオフ / FPS vs Accuracy Trade-off
+
+**重要: fpsを上げれば精度が上がるとは限らない**
+
+**Important: Higher fps does NOT always improve accuracy**
+
+| fps | メリット / Pros | デメリット / Cons |
+|-----|----------------|-------------------|
+| 低 (2-4) | dyが大きく追跡しやすい / Larger dy, easier tracking | フレーム少、補間が必要 / Fewer frames, interpolation needed |
+| 高 (10+) | フレーム数が多い / More frames | 小さいdyで誤検出増加 / Small dy causes tracking errors |
+
+**推奨: fps=2-4 から開始し、結果を見て調整**
+
+**Recommendation: Start with fps=2-4, check results, adjust as needed**
+
 ### 改善のヒント / Tips for Improvement
 
-- **fpsを上げる**: フレーム間のdyが小さくなり、追跡が安定
-- **Increase fps**: Smaller dy per frame, more stable tracking
+- **fpsを調整**: 高すぎると逆効果。2-4から開始
+- **Adjust fps**: Too high can be counterproductive. Start with 2-4
 
 - **テンプレート位置を調整**: 特徴的で長く画面に残る領域を選ぶ
 - **Adjust template position**: Choose distinctive regions that stay visible longer
@@ -398,6 +413,53 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 ## ライセンス / License
 
 MIT License
+
+---
+
+## 自動分析機能 / Auto Analysis
+
+実行後に `debug_positions.csv` を自動分析し、改善提案を表示します。
+
+After execution, automatically analyzes `debug_positions.csv` and shows suggestions.
+
+### 出力例 / Example Output
+
+```
+============================================================
+[Analysis Results]
+============================================================
+  Frames: 18
+  Total movement: 1038px
+  dy mean: 69.2px (std: 35.2)
+  Zero dy ratio: 11.8% (2/17)
+  Low score ratio: 0/17
+
+[Suggestions]
+
+  1. Unstable dy estimation
+     -> Try --match-method phase (may be more stable than template)
+     -> --template-region to specify stable region
+     -> Try --uniform-dy 93
+
+  2. Low total movement (expected: ~1581px)
+     -> Manually interpolate dy=0 sections
+     -> Try --uniform-dy 93
+
+[Recommended command]
+  python video_strip_reconstruct.py --frames "..." \
+    --strip-y 0 --strip-h 1080 \
+    --uniform-dy -93 --edge-thr 0.35 --out outdir
+============================================================
+```
+
+### 検出される問題 / Detected Issues
+
+| 問題 / Issue | 条件 / Condition | 提案 / Suggestion |
+|-------------|-----------------|-------------------|
+| dy=0が多い | >20% | fpsを下げる、template-region指定 |
+| dy不安定 | std > mean*0.5 | phase method、uniform-dy |
+| 低スコア | >30% | テンプレート変更、ignore指定 |
+| 移動量不足 | <期待値の70% | 手動補間、uniform-dy |
 
 ---
 
@@ -440,7 +502,11 @@ MIT License
 
 Aims to generate good candidates rather than perfect results.
 
-### 検証予定 / TODO
+### 検証済み / Verified
 
-- [ ] fpsを上げた場合の精度向上を検証
-- [ ] Verify accuracy improvement with higher fps
+- [x] fpsを上げた場合の精度 → **逆効果になる場合あり**
+- [x] Higher fps accuracy → **Can be counterproductive**
+
+fps=2-4が推奨。fpsが高すぎると小さいdyで追跡エラーが増加。
+
+fps=2-4 recommended. Too high fps causes tracking errors with small dy.
