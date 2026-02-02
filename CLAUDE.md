@@ -4,9 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Image stitching tool for combining scroll/pan screenshots. Generates multiple "nearly-correct" candidates for human visual selection rather than attempting fully automatic perfect stitching.
+Image stitching tools for combining scroll/pan screenshots and reconstructing backgrounds from video. Generates multiple "nearly-correct" candidates for human visual selection rather than attempting fully automatic perfect stitching.
 
 **Design philosophy**: Human-in-the-loop - generate many candidates, let humans choose the best one, then refine.
+
+### Tools
+
+1. **stitch_candidates.py** - Static image stitching (screenshots)
+2. **video_strip_reconstruct.py** - Video background reconstruction with text removal
 
 ## Main Script
 
@@ -90,3 +95,59 @@ Scoring (scan mode):
 - Combined score = harmonic mean of matching score and boundary similarity (SSIM)
 - Outputs ranked by combined score
 - Shows diagnostic info when no valid candidates found
+
+---
+
+## Video Background Reconstruction
+
+`video_strip_reconstruct.py` - Reconstructs backgrounds from vertical scrolling videos while removing text overlays.
+
+### Running
+
+```bash
+# From video (with ffmpeg)
+python video_strip_reconstruct.py --video input.mp4 --fps 2 \
+  --strip-y 980 --strip-h 100 --out outdir
+
+# From extracted frames
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 980 --strip-h 100 --out outdir
+
+# Multiple edge thresholds for candidate generation
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 980 --strip-h 100 --edge-thr 0.3,0.4,0.5 --out outdir
+
+# Multiple matching methods
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 980 --strip-h 100 --match-method phase,ncc_gray --out outdir
+```
+
+### Key Parameters
+
+- `--strip-y` - Top Y of horizontal strip (required)
+- `--strip-h` - Height of strip (default: 100)
+- `--edge-thr` - Edge threshold(s) for text masking (comma-separated)
+- `--match-method` - Matching method: phase, ncc_gray, ncc_edge, phase_gray
+- `--min-peak` - Peak score threshold for diagnostics
+- `--ignore` / `--ignore-pct` - Ignore regions (same format as stitch_candidates)
+
+### Output Files
+
+- `recon_dy.png` - Result using dy as-is
+- `recon_negdy.png` - Result using negated dy
+- `recon_dy_e0.XX.png` - Result with specific edge-thr
+- `debug_positions.csv` - Per-frame dy estimation with peak scores
+
+### Architecture
+
+- Extracts horizontal strip from each frame
+- Estimates dy (vertical shift) using phase correlation on edge maps
+- Outputs both dy and -dy candidates (sign can be inverted)
+- Text removal: pixels with high edge strength are masked, background-like pixels prioritized
+
+### Matching Methods
+
+- `phase` (default) - Phase correlation on edge map
+- `phase_gray` - Phase correlation on grayscale
+- `ncc_gray` - NCC on grayscale (slower but robust)
+- `ncc_edge` - NCC on edge map

@@ -5,11 +5,11 @@ video_strip_reconstruct.py
 
 縦パン（縦スクロール）する動画から、固定の横長帯(例: 1920x100)を切り出し、
 背景に合わせてフレームを縦方向に整列しつつ、テロップ（縦スクロール or 固定）を
-「できる範囲で」避けて背景を復元する“プロトタイプ”です。
+「できる範囲で」避けて背景を復元する"プロトタイプ"です。
 
 狙い:
 - まず動くテロップを「フレーム単位で選別」ではなく「画素単位で採用/不採用」にする
-- 背景の縦方向移動(dy)を推定し、帯を“背景座標系”に貼り付けて縦長画像を作る
+- 背景の縦方向移動(dy)を推定し、帯を"背景座標系"に貼り付けて縦長画像を作る
 - テロップのような高コントラスト輪郭（文字）は edge 強度で弾き、背景っぽい画素を優先
 
 注意:
@@ -35,6 +35,14 @@ ffmpeg があると「動画→フレーム抽出」を自動でできます。
   # 既に抽出済みPNGを使う
   python video_strip_reconstruct.py --frames "frames/*.png" --strip-y 980 --strip-h 100 --out outdir
 
+  # 複数のedge-thrで候補を生成
+  python video_strip_reconstruct.py --frames "frames/*.png" --strip-y 980 --strip-h 100 \
+    --edge-thr 0.3,0.4,0.5 --out outdir
+
+  # NCCベースのマッチングを追加で使用
+  python video_strip_reconstruct.py --frames "frames/*.png" --strip-y 980 --strip-h 100 \
+    --match-method phase,ncc_gray --out outdir
+
 出力:
   outdir/recon_dy.png      # dyをそのまま積算した候補
   outdir/recon_negdy.png   # -dyを積算した候補
@@ -50,7 +58,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 from PIL import Image
@@ -198,6 +206,94 @@ def phase_correlation(a: np.ndarray, b: np.ndarray) -> Tuple[int, int, float]:
     return int(dx), int(dy), peak
 
 
+def _shift_crop(a: np.ndarray, b: np.ndarray, dx: int, dy: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Crop overlapping region after shifting b by (dx, dy)."""
+    h, w = a.shape
+    # a stays fixed, b shifts by (dx, dy)
+    ax0 = max(0, dx)
+    ax1 = min(w, w + dx)
+    ay0 = max(0, dy)
+    ay1 = min(h, h + dy)
+    bx0 = max(0, -dx)
+    bx1 = min(w, w - dx)
+    by0 = max(0, -dy)
+    by1 = min(h, h - dy)
+    return a[ay0:ay1, ax0:ax1], b[by0:by1, bx0:bx1]
+
+
+def brute_ncc(a: np.ndarray, b: np.ndarray, search: int) -> Tuple[int, int, float]:
+    """Brute-force normalized cross-correlation within ±search range."""
+    best_dx, best_dy, best_score = 0, 0, -np.inf
+    for dy in range(-search, search + 1):
+        for dx in range(-search, search + 1):
+            a_crop, b_crop = _shift_crop(a, b, dx, dy)
+            if a_crop.size == 0:
+                continue
+            ma = a_crop.mean()
+            mb = b_crop.mean()
+            a_centered = a_crop - ma
+            b_centered = b_crop - mb
+            denom = np.sqrt(np.sum(a_centered ** 2) * np.sum(b_centered ** 2))
+            if denom < 1e-9:
+                continue
+            ncc = np.sum(a_centered * b_centered) / denom
+            if ncc > best_score:
+                best_score = ncc
+                best_dx, best_dy = dx, dy
+    return best_dx, best_dy, float(best_score)
+
+
+@dataclass
+class MatchResult:
+    """Result from a single matching method."""
+    method: str
+    dx: int
+    dy: int
+    score: float
+
+
+def estimate_dy_multi(prev_rgb: np.ndarray, next_rgb: np.ndarray, ignore_regions: List[IgnoreRegion],
+                      search: int = 40, methods: List[str] = None) -> List[MatchResult]:
+    """
+    prev -> next のdyを複数手法で推定する
+
+    methods: ["phase", "ncc_gray", "ncc_edge"]
+    returns: List of MatchResult (one per method)
+    """
+    if methods is None:
+        methods = ["phase"]
+
+    gray_a = to_gray_f32(prev_rgb)
+    gray_b = to_gray_f32(next_rgb)
+    if ignore_regions:
+        gray_a = apply_ignore_gray(gray_a, ignore_regions)
+        gray_b = apply_ignore_gray(gray_b, ignore_regions)
+
+    edge_a = sobel_edge(gray_a)
+    edge_b = sobel_edge(gray_b)
+
+    results: List[MatchResult] = []
+
+    for method in methods:
+        if method == "phase":
+            dx, dy, score = phase_correlation(edge_a, edge_b)
+            dy = int(np.clip(dy, -search, search))
+            results.append(MatchResult("phase", dx, dy, score))
+        elif method == "ncc_gray":
+            dx, dy, score = brute_ncc(gray_a, gray_b, search)
+            results.append(MatchResult("ncc_gray", dx, dy, score))
+        elif method == "ncc_edge":
+            dx, dy, score = brute_ncc(edge_a, edge_b, search)
+            results.append(MatchResult("ncc_edge", dx, dy, score))
+        elif method == "phase_gray":
+            # phase correlation on grayscale (without edge)
+            dx, dy, score = phase_correlation(gray_a, gray_b)
+            dy = int(np.clip(dy, -search, search))
+            results.append(MatchResult("phase_gray", dx, dy, score))
+
+    return results
+
+
 def estimate_dy(prev_rgb: np.ndarray, next_rgb: np.ndarray, ignore_regions: List[IgnoreRegion],
                 search: int = 40, use_edges: bool = True) -> Tuple[int, float]:
     """
@@ -332,21 +428,67 @@ def render_candidate(strips: List[np.ndarray], positions: List[int], out_path: P
 
     save_rgb(canvas, out_path)
 
-def write_positions_csv(paths: List[Path], dys: List[int], pos1: List[int], pos2: List[int], out_csv: Path) -> None:
+def write_positions_csv(paths: List[Path], dys: List[int], peaks: List[float],
+                        pos1: List[int], pos2: List[int], out_csv: Path,
+                        min_peak: float = 0.0) -> None:
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["index", "frame", "dy", "pos_dy", "pos_negdy"])
+        w.writerow(["index", "frame", "dy", "peak", "reliable", "pos_dy", "pos_negdy"])
         for i, p in enumerate(paths):
-            dy = dys[i] if i < len(dys) else ""
-            w.writerow([i, p.name, dy, pos1[i], pos2[i]])
+            if i < len(dys):
+                dy = dys[i]
+                peak = peaks[i]
+                reliable = "OK" if peak >= min_peak else "LOW"
+            else:
+                dy = ""
+                peak = ""
+                reliable = ""
+            w.writerow([i, p.name, dy, f"{peak:.4f}" if isinstance(peak, float) else peak,
+                       reliable, pos1[i], pos2[i]])
 
 
 # -------------------------
 # Main
 # -------------------------
 
+def show_diagnostics(dys: List[int], peaks: List[float], frame_paths: List[Path],
+                     min_peak: float) -> None:
+    """Show diagnostic info for unreliable dy estimates."""
+    low_peak_indices = [i for i, p in enumerate(peaks) if p < min_peak]
+    if not low_peak_indices:
+        return
+
+    print(f"\n[診断] ピークスコアが低いフレーム ({len(low_peak_indices)}件, 閾値: {min_peak:.4f}):")
+    print("[Diagnostic] Frames with low peak score:")
+    for i in low_peak_indices[:10]:  # show max 10
+        print(f"  Frame {i+1}: {frame_paths[i+1].name} <- {frame_paths[i].name}")
+        print(f"    dy={dys[i]:+3d}, peak={peaks[i]:.4f}")
+    if len(low_peak_indices) > 10:
+        print(f"  ... and {len(low_peak_indices) - 10} more")
+
+    # variance check
+    if len(dys) >= 3:
+        dy_std = np.std(dys)
+        dy_mean = np.mean(dys)
+        print(f"\n[統計] dy: mean={dy_mean:.1f}, std={dy_std:.1f}")
+        if dy_std > abs(dy_mean) * 0.5 and abs(dy_mean) > 1:
+            print("  -> dy推定が不安定な可能性があります")
+            print("  -> dy estimation may be unstable")
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+推奨ワークフロー / Recommended Workflow:
+  1. --edge-thr を複数試す (例: 0.3,0.4,0.5)
+  2. recon_dy.png と recon_negdy.png を確認
+  3. 良い方を選び、必要に応じて --edge-thr を調整
+
+例 / Example:
+  python video_strip_reconstruct.py --video input.mp4 --fps 2 \\
+    --strip-y 980 --strip-h 100 --edge-thr 0.3,0.4,0.5 --out outdir
+""")
     ap.add_argument("--video", type=str, default="", help="Input video path (optional if --frames is used)")
     ap.add_argument("--frames", type=str, default="", help='Glob for extracted frames, e.g. "frames/*.png"')
     ap.add_argument("--out", type=str, default="recon_out", help="Output directory")
@@ -360,18 +502,30 @@ def main() -> None:
     ap.add_argument("--strip-h", type=int, default=100, help="Height of strip (px)")
 
     ap.add_argument("--dy-search", type=int, default=40, help="Clamp dy to +/- this")
-    ap.add_argument("--edge-thr", type=float, default=0.35, help="Edge threshold for 'text-like' masking (0..1, higher=less masked)")
+    ap.add_argument("--edge-thr", type=str, default="0.35",
+                    help="Edge threshold(s) for 'text-like' masking. Comma-separated for multiple candidates (e.g. 0.3,0.4,0.5)")
     ap.add_argument("--no-edges", action="store_true", help="Use raw grayscale (not edges) for dy estimation")
+
+    ap.add_argument("--min-peak", type=float, default=0.0,
+                    help="Minimum peak score for reliable dy estimation. Shows diagnostic when below (default: 0=disabled)")
+    ap.add_argument("--match-method", type=str, default="phase",
+                    help="Matching method(s): phase, ncc_gray, ncc_edge, phase_gray. Comma-separated (default: phase)")
 
     ap.add_argument("--ignore", action="append", default=[],
                     help='Ignore region (px): "top,(right|left|X),width,height"  e.g. "0,right,220,120"')
     ap.add_argument("--ignore-pct", action="append", default=[],
-                    help='Ignore region (%): "top,(right|left|X),width,height"  e.g. "0,right,12,8"')
+                    help='Ignore region (pct): "top,(right|left|X),width,height"  e.g. "0,right,12,8"')
 
     args = ap.parse_args()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Parse edge thresholds (multiple values supported)
+    edge_thrs = [float(x.strip()) for x in args.edge_thr.split(",")]
+
+    # Parse matching methods
+    match_methods = [m.strip() for m in args.match_method.split(",")]
 
     ignore_regions: List[IgnoreRegion] = []
     for s in args.ignore:
@@ -395,6 +549,7 @@ def main() -> None:
         raise SystemExit("Need at least 2 frames")
 
     # load frames
+    print(f"Loading {len(frame_paths)} frames...")
     frames_rgb = [load_rgb(p) for p in frame_paths]
     full_h, full_w, _ = frames_rgb[0].shape
 
@@ -409,15 +564,36 @@ def main() -> None:
         if s.shape[1] != W or s.shape[0] != Hs:
             raise SystemExit("All strips must have same size")
 
-    # estimate dy between consecutive full frames (better than strip-only when strip is dominated by text)
-    dys: List[int] = []
-    peaks: List[float] = []
-    use_edges = (not args.no_edges)
-    for i in range(1, len(frames_rgb)):
-        dy, peak = estimate_dy(frames_rgb[i-1], frames_rgb[i], ignore_regions=ignore_regions,
-                               search=args.dy_search, use_edges=use_edges)
-        dys.append(dy)
-        peaks.append(peak)
+    # estimate dy between consecutive full frames using multiple methods
+    print(f"Estimating dy using method(s): {', '.join(match_methods)}...")
+
+    # Store results per method
+    method_results: Dict[str, Tuple[List[int], List[float]]] = {}
+
+    for method in match_methods:
+        dys: List[int] = []
+        peaks: List[float] = []
+        for i in range(1, len(frames_rgb)):
+            results = estimate_dy_multi(frames_rgb[i-1], frames_rgb[i],
+                                        ignore_regions=ignore_regions,
+                                        search=args.dy_search,
+                                        methods=[method])
+            if results:
+                r = results[0]
+                dys.append(r.dy)
+                peaks.append(r.score)
+            else:
+                dys.append(0)
+                peaks.append(0.0)
+        method_results[method] = (dys, peaks)
+
+    # Use first method as primary
+    primary_method = match_methods[0]
+    dys, peaks = method_results[primary_method]
+
+    # Show diagnostics if min-peak is set
+    if args.min_peak > 0:
+        show_diagnostics(dys, peaks, frame_paths, args.min_peak)
 
     # two candidate position sequences: sum(dy) and sum(-dy)
     pos_dy = [0]
@@ -426,23 +602,49 @@ def main() -> None:
         pos_dy.append(pos_dy[-1] + dy)
         pos_negdy.append(pos_negdy[-1] - dy)
 
-    # render
-    out1 = out_dir / "recon_dy.png"
-    out2 = out_dir / "recon_negdy.png"
-    render_candidate(strips=strips, positions=pos_dy, out_path=out1,
-                     edge_thr=args.edge_thr, ignore_regions=ignore_regions,
-                     full_w=full_w, full_h=full_h, strip_y=args.strip_y)
-    render_candidate(strips=strips, positions=pos_negdy, out_path=out2,
-                     edge_thr=args.edge_thr, ignore_regions=ignore_regions,
-                     full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+    # render candidates for each edge_thr
+    output_files = []
+    for edge_thr in edge_thrs:
+        suffix = f"_e{edge_thr:.2f}" if len(edge_thrs) > 1 else ""
+        out1 = out_dir / f"recon_dy{suffix}.png"
+        out2 = out_dir / f"recon_negdy{suffix}.png"
+        render_candidate(strips=strips, positions=pos_dy, out_path=out1,
+                         edge_thr=edge_thr, ignore_regions=ignore_regions,
+                         full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+        render_candidate(strips=strips, positions=pos_negdy, out_path=out2,
+                         edge_thr=edge_thr, ignore_regions=ignore_regions,
+                         full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+        output_files.extend([out1, out2])
 
-    # debug csv
-    write_positions_csv(frame_paths, dys, pos_dy, pos_negdy, out_dir / "debug_positions.csv")
+    # If multiple methods, also output candidates per method (using first edge_thr)
+    if len(match_methods) > 1:
+        primary_edge_thr = edge_thrs[0]
+        for method in match_methods[1:]:
+            m_dys, m_peaks = method_results[method]
+            m_pos_dy = [0]
+            m_pos_negdy = [0]
+            for dy in m_dys:
+                m_pos_dy.append(m_pos_dy[-1] + dy)
+                m_pos_negdy.append(m_pos_negdy[-1] - dy)
 
-    print("Done:")
-    print(f"  {out1}")
-    print(f"  {out2}")
-    print(f"  {out_dir / 'debug_positions.csv'}")
+            out1 = out_dir / f"recon_{method}_dy.png"
+            out2 = out_dir / f"recon_{method}_negdy.png"
+            render_candidate(strips=strips, positions=m_pos_dy, out_path=out1,
+                             edge_thr=primary_edge_thr, ignore_regions=ignore_regions,
+                             full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+            render_candidate(strips=strips, positions=m_pos_negdy, out_path=out2,
+                             edge_thr=primary_edge_thr, ignore_regions=ignore_regions,
+                             full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+            output_files.extend([out1, out2])
+
+    # debug csv (include peak scores)
+    csv_path = out_dir / "debug_positions.csv"
+    write_positions_csv(frame_paths, dys, peaks, pos_dy, pos_negdy, csv_path, min_peak=args.min_peak)
+
+    print("\nDone:")
+    for f in output_files:
+        print(f"  {f}")
+    print(f"  {csv_path}")
 
 
 if __name__ == "__main__":
