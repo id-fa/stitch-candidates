@@ -109,6 +109,9 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 | `--match-method` | マッチング手法 (default: phase) | Matching method(s) |
 | `--min-peak` | ピークスコア閾値（診断用） | Peak score threshold for diagnostics |
 | `--no-edges` | エッジなしでdy推定 | Use grayscale (not edges) for dy estimation |
+| `--dy-region` | dy推定に使う領域 "y,h" | Region for dy estimation "y,h" |
+| `--template-region` | テンプレート領域 "y,h,x,w" | Manual template region "y,h,x,w" |
+| `--uniform-dy` | 均一なdy値を直接指定 | Use uniform dy per frame |
 
 ### テロップ除去設定 / Text Removal Settings
 
@@ -117,6 +120,14 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 | `--edge-thr` | エッジ閾値（カンマ区切りで複数可） | Edge threshold(s), comma-separated |
 | `--ignore` | 無視領域 (px) | Ignore region in pixels |
 | `--ignore-pct` | 無視領域 (%) | Ignore region in percentage |
+
+### スクロール方向・モード / Scroll Direction & Mode
+
+| パラメータ | 説明 | Description |
+|-----------|------|-------------|
+| `--scroll-dir` | スクロール方向: up/down/both (default: both) | Scroll direction |
+| `--static-bg` | 背景固定モード（時間的中央値で復元） | Static background mode |
+| `--static-method` | static-bgの手法: median/min_edge | Method for static-bg mode |
 
 ### 出力 / Output
 
@@ -134,6 +145,28 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 | `phase_gray` | グレースケールでの位相相関 / Phase correlation on grayscale |
 | `ncc_gray` | グレースケールNCC / NCC on grayscale |
 | `ncc_edge` | エッジマップNCC / NCC on edge map |
+| `template` | テンプレートマッチング追跡 / Template matching with tracking |
+
+### template メソッドについて / About template method
+
+テンプレートマッチングは、背景がスクロールする動画で最も正確なdy推定ができます。
+
+Template matching provides the most accurate dy estimation for scrolling backgrounds.
+
+- 特徴的な領域を自動選択して追跡 / Automatically selects and tracks distinctive regions
+- 外れ値検出と補間で追跡ロスを補正 / Outlier detection and interpolation handle tracking loss
+- `--template-region "y,h,x,w"` で手動指定も可能 / Manual specification available
+
+```bash
+# 自動テンプレート選択 / Automatic template selection
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 0 --strip-h 1080 --match-method template --out outdir
+
+# 手動テンプレート指定 / Manual template specification
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 0 --strip-h 1080 --match-method template \
+  --template-region "350,150,750,150" --out outdir
+```
 
 複数指定可能（カンマ区切り）：
 
@@ -235,6 +268,7 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 | `recon_negdy.png` | -dyを積算した結果 | Result with negated dy |
 | `recon_dy_e0.XX.png` | edge-thr=0.XX での dy結果 | dy result with edge-thr=0.XX |
 | `recon_{method}_dy.png` | 特定手法での dy結果 | dy result from specific method |
+| `recon_static_median.png` | static-bgモードの結果 | Result from static-bg mode |
 | `debug_positions.csv` | 各フレームの推定情報 | Estimation info per frame |
 
 ### debug_positions.csv の内容 / Contents
@@ -246,6 +280,65 @@ index,frame,dy,peak,reliable,pos_dy,pos_negdy
 2,frame_000003.png,7,0.1987,OK,15,-15
 3,frame_000004.png,9,0.0823,LOW,24,-24
 ```
+
+---
+
+## シナリオ別アプローチ / Scenario-based Approaches
+
+### シナリオA: 背景がスクロール、テキストは固定（出現/消失）
+
+**Scenario A: Background scrolls, text is static (appears/disappears)**
+
+```bash
+# templateメソッドで正確なdy推定
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 0 --strip-h 1080 --match-method template \
+  --edge-thr 0.35 --out outdir
+```
+
+- テンプレート追跡が最も効果的 / Template tracking is most effective
+- 追跡が途切れた区間は自動補間 / Lost tracking is auto-interpolated
+- 必要に応じて `--template-region` で手動指定 / Use `--template-region` if needed
+
+### シナリオB: 背景固定、テキストがスクロール
+
+**Scenario B: Background is static, text scrolls**
+
+```bash
+# static-bgモードで時間的中央値を計算
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 0 --strip-h 1080 --static-bg --static-method median --out outdir
+```
+
+- テキストが一時的に通過する場合に有効 / Effective when text passes temporarily
+- `min_edge` は最小エッジ強度の画素を選択 / `min_edge` selects pixels with lowest edge strength
+
+### シナリオC: 背景とテキストが一緒にスクロール
+
+**Scenario C: Both background and text scroll together**
+
+```bash
+# 従来の方法（位相相関）が有効
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 980 --strip-h 100 --match-method phase \
+  --ignore-pct "30,25,50,40" --out outdir
+```
+
+- `--ignore` でテキスト領域を除外 / Use `--ignore` to exclude text regions
+
+### シナリオD: スクロール速度が既知
+
+**Scenario D: Scroll speed is known**
+
+```bash
+# 均一なdyを直接指定
+python video_strip_reconstruct.py --frames "frames/*.png" \
+  --strip-y 0 --strip-h 1080 --uniform-dy -50 \
+  --edge-thr 0.35 --out outdir
+```
+
+- 最も確実な方法 / Most reliable method
+- 事前にフレーム間の移動量を計測しておく / Pre-measure displacement between frames
 
 ---
 
@@ -262,6 +355,32 @@ index,frame,dy,peak,reliable,pos_dy,pos_negdy
 - 横スクロール動画（水平パン）
 - 不規則な動きのある映像
 - 極端に短い動画（フレーム数が少なすぎる）
+
+---
+
+## 既知の制限事項 / Known Limitations
+
+### dy推定の問題 / dy Estimation Issues
+
+- **位相相関の弱点**: 繰り返しパターン（花柄装飾等）で誤検出しやすい
+- **Phase correlation weakness**: Prone to errors with repetitive patterns (floral decorations, etc.)
+
+- **テンプレート追跡のロス**: 追跡対象がフレーム外に出ると途切れる
+- **Template tracking loss**: Tracking fails when target exits frame
+
+- **累積誤差**: dyの小さな誤差が累積して画質劣化の原因になる
+- **Accumulated errors**: Small dy errors accumulate and cause quality degradation
+
+### 改善のヒント / Tips for Improvement
+
+- **fpsを上げる**: フレーム間のdyが小さくなり、追跡が安定
+- **Increase fps**: Smaller dy per frame, more stable tracking
+
+- **テンプレート位置を調整**: 特徴的で長く画面に残る領域を選ぶ
+- **Adjust template position**: Choose distinctive regions that stay visible longer
+
+- **手動でdy調整**: `debug_positions.csv` を確認して異常値を修正
+- **Manual dy adjustment**: Check `debug_positions.csv` and fix outliers
 
 ---
 
@@ -282,6 +401,35 @@ MIT License
 
 ---
 
+## トラブルシューティング / Troubleshooting
+
+### 結果がズレている / Result is misaligned
+
+1. `debug_positions.csv` でdy値を確認
+2. 異常値（0や極端に大きな値）がないかチェック
+3. `--match-method template` を試す
+4. 必要に応じて `--uniform-dy` で手動指定
+
+### テンプレート追跡が失敗する / Template tracking fails
+
+1. `--template-region` で特徴的な領域を手動指定
+2. fpsを上げてフレーム数を増やす
+3. 追跡対象が画面内に長く留まる領域を選ぶ
+
+### テキストが残る / Text remains in result
+
+1. `--edge-thr` を上げる（0.4〜0.5）
+2. テキストがない瞬間が少ない場合は限界
+3. 後処理で画像編集ソフトを使用
+
+### 位相相関がdy=0を返す / Phase correlation returns dy=0
+
+1. 背景が本当に動いていない可能性を確認
+2. `--match-method template` に切り替え
+3. `--ignore` で問題のある領域を除外
+
+---
+
 ## まとめ / Summary
 
 > **縦スクロール動画から、テロップを避けて背景を復元する**
@@ -291,3 +439,8 @@ MIT License
 完璧な結果より、良い候補を生成することを目指しています。
 
 Aims to generate good candidates rather than perfect results.
+
+### 検証予定 / TODO
+
+- [ ] fpsを上げた場合の精度向上を検証
+- [ ] Verify accuracy improvement with higher fps

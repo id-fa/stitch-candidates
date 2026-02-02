@@ -221,6 +221,165 @@ def _shift_crop(a: np.ndarray, b: np.ndarray, dx: int, dy: int) -> Tuple[np.ndar
     return a[ay0:ay1, ax0:ax1], b[by0:by1, bx0:bx1]
 
 
+def template_match_dy(prev_rgb: np.ndarray, next_rgb: np.ndarray,
+                      template_regions: List[Tuple[int, int, int, int]],
+                      prev_offsets: List[Tuple[int, int]] = None) -> Tuple[int, float, List[Tuple[int, int]]]:
+    """
+    テンプレートマッチングでdy推定。複数テンプレートを追跡し、中央値を返す。
+
+    template_regions: [(y1, y2, x1, x2), ...] - 初期テンプレート領域
+    prev_offsets: [(y_offset, x_offset), ...] - 前フレームでの各テンプレートの位置オフセット
+
+    Returns: (dy, score, new_offsets)
+    """
+    if HAS_CV2:
+        prev_gray = cv2.cvtColor(prev_rgb, cv2.COLOR_RGB2GRAY)
+        next_gray = cv2.cvtColor(next_rgb, cv2.COLOR_RGB2GRAY)
+    else:
+        prev_gray = (0.299*prev_rgb[:,:,0] + 0.587*prev_rgb[:,:,1] + 0.114*prev_rgb[:,:,2]).astype(np.uint8)
+        next_gray = (0.299*next_rgb[:,:,0] + 0.587*next_rgb[:,:,1] + 0.114*next_rgb[:,:,2]).astype(np.uint8)
+
+    if prev_offsets is None:
+        prev_offsets = [(0, 0)] * len(template_regions)
+
+    dys = []
+    scores = []
+    new_offsets = []
+
+    for i, (y1, y2, x1, x2) in enumerate(template_regions):
+        # 前フレームでのテンプレート位置（追跡によるオフセットを適用）
+        off_y, off_x = prev_offsets[i]
+        ty1 = max(0, y1 + off_y)
+        ty2 = min(prev_gray.shape[0], y2 + off_y)
+        tx1 = max(0, x1 + off_x)
+        tx2 = min(prev_gray.shape[1], x2 + off_x)
+
+        if ty2 - ty1 < 20 or tx2 - tx1 < 20:
+            # テンプレートが画面外
+            new_offsets.append((off_y, off_x))
+            continue
+
+        template = prev_gray[ty1:ty2, tx1:tx2]
+
+        if HAS_CV2:
+            result = cv2.matchTemplate(next_gray, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        else:
+            # Fallback without OpenCV (slow)
+            max_val, max_loc = _template_match_numpy(next_gray, template)
+
+        if max_val > 0.7:  # 信頼できるマッチのみ採用
+            dy = max_loc[1] - ty1
+            dx = max_loc[0] - tx1
+            dys.append(dy)
+            scores.append(max_val)
+            new_offsets.append((off_y + dy, off_x + dx))
+        else:
+            # マッチ失敗、前のオフセットを維持
+            new_offsets.append((off_y, off_x))
+
+    if dys:
+        dy_median = int(np.median(dys))
+        score_mean = float(np.mean(scores))
+        return dy_median, score_mean, new_offsets
+    else:
+        return 0, 0.0, new_offsets
+
+
+def _template_match_numpy(img: np.ndarray, template: np.ndarray) -> Tuple[float, Tuple[int, int]]:
+    """NumPyのみでのテンプレートマッチング（遅い）"""
+    th, tw = template.shape
+    ih, iw = img.shape
+    best_val = -1.0
+    best_loc = (0, 0)
+
+    # 粗い探索（10pxステップ）
+    for y in range(0, ih - th, 10):
+        for x in range(0, iw - tw, 10):
+            patch = img[y:y+th, x:x+tw]
+            corr = np.corrcoef(patch.flatten(), template.flatten())[0, 1]
+            if corr > best_val:
+                best_val = corr
+                best_loc = (x, y)
+
+    # 細かい探索
+    bx, by = best_loc
+    for y in range(max(0, by-10), min(ih-th, by+11)):
+        for x in range(max(0, bx-10), min(iw-tw, bx+11)):
+            patch = img[y:y+th, x:x+tw]
+            corr = np.corrcoef(patch.flatten(), template.flatten())[0, 1]
+            if corr > best_val:
+                best_val = corr
+                best_loc = (x, y)
+
+    return best_val, best_loc
+
+
+def select_template_regions(rgb: np.ndarray, n_templates: int = 8,
+                            exclude_center: bool = True) -> List[Tuple[int, int, int, int]]:
+    """
+    特徴的な領域を自動選択してテンプレート候補を返す。
+    エッジ強度が高い領域を優先し、中央のテキスト領域を避ける。
+    左右端を優先的に選択（テキストが中央にある場合に有効）。
+    """
+    gray = to_gray_f32(rgb)
+    edge = sobel_edge(gray)
+
+    h, w = edge.shape
+    template_h, template_w = 150, 150
+
+    # マスク: 中央のテキスト領域を広く除外
+    mask = np.ones_like(edge)
+    if exclude_center:
+        # 中央60%を除外（テキスト領域）
+        cx = w // 2
+        mask[:, int(cx-w*0.30):int(cx+w*0.30)] = 0
+
+    # 上下端を広く除外（画面外に出やすい）
+    margin_y = int(h * 0.15)
+    mask[:margin_y, :] = 0
+    mask[-margin_y:, :] = 0
+
+    # エッジ強度でブロックごとのスコアを計算
+    candidates = []
+    step = 60
+    for y in range(0, h - template_h, step):
+        for x in range(0, w - template_w, step):
+            region_mask = mask[y:y+template_h, x:x+template_w]
+            if region_mask.mean() < 0.8:  # マスク領域を厳しく除外
+                continue
+            region_edge = edge[y:y+template_h, x:x+template_w]
+            score = region_edge.mean()
+            # 左右端にボーナス（テキストから離れている）
+            if x < w * 0.25 or x > w * 0.75:
+                score *= 1.5
+            candidates.append((score, y, y+template_h, x, x+template_w))
+
+    # スコア順にソートして上位を選択
+    candidates.sort(reverse=True)
+
+    # 重複を避けて選択（最小間隔を確保）
+    selected = []
+    min_dist = 100
+    for score, y1, y2, x1, x2 in candidates:
+        # 既選択と十分離れているか確認
+        too_close = False
+        for _, sy1, sy2, sx1, sx2 in selected:
+            cy1, cx1 = (y1+y2)//2, (x1+x2)//2
+            cy2, cx2 = (sy1+sy2)//2, (sx1+sx2)//2
+            dist = ((cy1-cy2)**2 + (cx1-cx2)**2)**0.5
+            if dist < min_dist:
+                too_close = True
+                break
+        if not too_close:
+            selected.append((score, y1, y2, x1, x2))
+            if len(selected) >= n_templates:
+                break
+
+    print(f"  Selected {len(selected)} template regions")
+    return [(y1, y2, x1, x2) for _, y1, y2, x1, x2 in selected]
+
+
 def brute_ncc(a: np.ndarray, b: np.ndarray, search: int) -> Tuple[int, int, float]:
     """Brute-force normalized cross-correlation within ±search range."""
     best_dx, best_dy, best_score = 0, 0, -np.inf
@@ -252,12 +411,146 @@ class MatchResult:
     score: float
 
 
+@dataclass
+class TemplateTracker:
+    """テンプレートマッチング用の状態を保持"""
+    regions: List[Tuple[int, int, int, int]] = None
+    offsets: List[Tuple[int, int]] = None
+
+
+def _detect_and_fix_outliers(dys: List[int], scores: List[float]) -> List[int]:
+    """
+    明らかな外れ値を検出し、補間対象としてマーク（スコアを0に）。
+    - 符号が多数派と逆
+    - 絶対値が非常に大きい（他の2倍以上）
+    - 前後と比べて急激に変化
+    """
+    if len(dys) < 3:
+        return dys
+
+    result = list(dys)
+    nonzero = [d for d in dys if d != 0]
+    if len(nonzero) < 2:
+        return dys
+
+    # 符号の多数派を特定
+    positive = sum(1 for d in nonzero if d > 0)
+    negative = sum(1 for d in nonzero if d < 0)
+    expected_sign = 1 if positive >= negative else -1
+
+    # 絶対値の中央値
+    median_abs = np.median([abs(d) for d in nonzero])
+
+    for i, dy in enumerate(dys):
+        is_outlier = False
+        reason = ""
+
+        # 符号が逆で絶対値が大きい
+        if dy != 0 and np.sign(dy) != expected_sign and abs(dy) > median_abs * 0.5:
+            is_outlier = True
+            reason = f"wrong sign (expected {'+' if expected_sign > 0 else '-'})"
+
+        # 絶対値が非常に大きい（中央値の3倍以上）
+        if abs(dy) > median_abs * 3:
+            is_outlier = True
+            reason = f"too large (median_abs={median_abs:.0f})"
+
+        # 前後との急激な変化（前後両方と50%以上の差）
+        if not is_outlier and i > 0 and i < len(dys) - 1:
+            prev_dy = dys[i-1] if dys[i-1] != 0 else median_abs * expected_sign
+            next_dy = dys[i+1] if dys[i+1] != 0 else median_abs * expected_sign
+            if prev_dy != 0 and next_dy != 0:
+                avg_neighbor = (prev_dy + next_dy) / 2
+                if abs(dy - avg_neighbor) > abs(avg_neighbor) * 2:
+                    is_outlier = True
+                    reason = f"sudden change (neighbors avg={avg_neighbor:.0f})"
+
+        if is_outlier:
+            print(f"  Outlier at frame {i+1}: dy={dy} ({reason})")
+            result[i] = 0
+            scores[i] = 0.0
+
+    return result
+
+
+def _interpolate_lost_tracking(dys: List[int], scores: List[float], min_score: float = 0.5) -> List[int]:
+    """
+    追跡が途切れた区間を補間で埋める。
+    - スコアが低い区間
+    - dy=0が連続する区間（追跡が止まった可能性）
+    """
+    n = len(dys)
+    if n == 0:
+        return dys
+
+    result = list(dys)
+
+    # 有効なdy値のインデックスを特定
+    # 条件: スコアが十分高い AND dy!=0（または前後と整合性がある）
+    valid_indices = []
+    for i, (dy, s) in enumerate(zip(dys, scores)):
+        if s < min_score:
+            continue
+        # dy=0が3つ以上連続する場合は無効とみなす
+        if dy == 0:
+            zero_count = 1
+            for j in range(i-1, -1, -1):
+                if dys[j] == 0:
+                    zero_count += 1
+                else:
+                    break
+            for j in range(i+1, n):
+                if dys[j] == 0:
+                    zero_count += 1
+                else:
+                    break
+            if zero_count >= 3:
+                continue
+        valid_indices.append(i)
+
+    if len(valid_indices) < 2:
+        # 有効な値が少なすぎる場合、非ゼロの中央値で埋める
+        nonzero_dys = [d for d in dys if d != 0]
+        if nonzero_dys:
+            median_dy = int(np.median(nonzero_dys))
+        else:
+            median_dy = 0
+        return [median_dy if d == 0 and scores[i] < 0.9 else d for i, d in enumerate(dys)]
+
+    # 無効な区間を補間
+    for i in range(n):
+        if i not in valid_indices:
+            # 前後の有効な値を探す
+            prev_valid = None
+            next_valid = None
+            for j in range(i - 1, -1, -1):
+                if j in valid_indices:
+                    prev_valid = j
+                    break
+            for j in range(i + 1, n):
+                if j in valid_indices:
+                    next_valid = j
+                    break
+
+            if prev_valid is not None and next_valid is not None:
+                # 線形補間
+                t = (i - prev_valid) / (next_valid - prev_valid)
+                result[i] = int(dys[prev_valid] + t * (dys[next_valid] - dys[prev_valid]))
+            elif prev_valid is not None:
+                result[i] = dys[prev_valid]
+            elif next_valid is not None:
+                result[i] = dys[next_valid]
+
+    return result
+
+
 def estimate_dy_multi(prev_rgb: np.ndarray, next_rgb: np.ndarray, ignore_regions: List[IgnoreRegion],
-                      search: int = 40, methods: List[str] = None) -> List[MatchResult]:
+                      search: int = 40, methods: List[str] = None,
+                      template_tracker: TemplateTracker = None) -> List[MatchResult]:
     """
     prev -> next のdyを複数手法で推定する
 
-    methods: ["phase", "ncc_gray", "ncc_edge"]
+    methods: ["phase", "ncc_gray", "ncc_edge", "template"]
     returns: List of MatchResult (one per method)
     """
     if methods is None:
@@ -290,6 +583,18 @@ def estimate_dy_multi(prev_rgb: np.ndarray, next_rgb: np.ndarray, ignore_regions
             dx, dy, score = phase_correlation(gray_a, gray_b)
             dy = int(np.clip(dy, -search, search))
             results.append(MatchResult("phase_gray", dx, dy, score))
+        elif method == "template":
+            if template_tracker is None or template_tracker.regions is None:
+                # 初回: テンプレート領域を自動選択
+                template_tracker.regions = select_template_regions(prev_rgb)
+                template_tracker.offsets = None
+            dy, score, new_offsets = template_match_dy(
+                prev_rgb, next_rgb,
+                template_tracker.regions,
+                template_tracker.offsets
+            )
+            template_tracker.offsets = new_offsets
+            results.append(MatchResult("template", 0, dy, score))
 
     return results
 
@@ -385,6 +690,36 @@ def apply_ignore_to_strip_mask(mask: np.ndarray, strip_y: int, ignore_regions: L
         ry1 = sy1 - strip_y
         out[ry0:ry1, x0:x1] = True
     return out
+
+def render_static_background(strips: List[np.ndarray], out_path: Path,
+                             method: str = "median") -> None:
+    """
+    背景が固定の場合に、時間的な中央値/最小エッジで背景を復元する。
+    method: "median" or "min_edge"
+    """
+    # All strips should be the same size and position
+    H, W, C = strips[0].shape
+    stack = np.stack(strips, axis=0)  # (N, H, W, C)
+
+    if method == "median":
+        # 時間的中央値 - テキストが一時的に通過する場合に有効
+        result = np.median(stack, axis=0).astype(np.uint8)
+    else:
+        # min_edge: 各画素で最もエッジ強度が低いフレームを選択
+        N = len(strips)
+        edges = np.zeros((N, H, W), dtype=np.float32)
+        for i, strip in enumerate(strips):
+            edges[i] = sobel_edge(to_gray_f32(strip))
+        # 最小エッジのインデックス
+        min_idx = np.argmin(edges, axis=0)  # (H, W)
+        result = np.zeros((H, W, C), dtype=np.uint8)
+        for c in range(C):
+            for y in range(H):
+                for x in range(W):
+                    result[y, x, c] = stack[min_idx[y, x], y, x, c]
+
+    save_rgb(result, out_path)
+
 
 def render_candidate(strips: List[np.ndarray], positions: List[int], out_path: Path,
                      edge_thr: float, ignore_regions: List[IgnoreRegion], full_w: int, full_h: int,
@@ -484,10 +819,20 @@ def main() -> None:
   1. --edge-thr を複数試す (例: 0.3,0.4,0.5)
   2. recon_dy.png と recon_negdy.png を確認
   3. 良い方を選び、必要に応じて --edge-thr を調整
+  4. 方向が分かったら --scroll-dir up/down で絞り込み
 
 例 / Example:
+  # 両方向の候補を出力（デフォルト）
   python video_strip_reconstruct.py --video input.mp4 --fps 2 \\
     --strip-y 980 --strip-h 100 --edge-thr 0.3,0.4,0.5 --out outdir
+
+  # 上方向スクロール（コンテンツが下に移動）のみ出力
+  python video_strip_reconstruct.py --frames "frames/*.png" \\
+    --strip-y 980 --strip-h 100 --scroll-dir up --out outdir
+
+  # 下方向スクロール（コンテンツが上に移動）のみ出力
+  python video_strip_reconstruct.py --frames "frames/*.png" \\
+    --strip-y 980 --strip-h 100 --scroll-dir down --out outdir
 """)
     ap.add_argument("--video", type=str, default="", help="Input video path (optional if --frames is used)")
     ap.add_argument("--frames", type=str, default="", help='Glob for extracted frames, e.g. "frames/*.png"')
@@ -500,6 +845,8 @@ def main() -> None:
 
     ap.add_argument("--strip-y", type=int, required=True, help="Top Y of strip in full frame (px)")
     ap.add_argument("--strip-h", type=int, default=100, help="Height of strip (px)")
+    ap.add_argument("--dy-region", type=str, default="",
+                    help="Region for dy estimation: 'y,h' (e.g. '0,200' for top 200px). If empty, use full frame.")
 
     ap.add_argument("--dy-search", type=int, default=40, help="Clamp dy to +/- this")
     ap.add_argument("--edge-thr", type=str, default="0.35",
@@ -509,7 +856,17 @@ def main() -> None:
     ap.add_argument("--min-peak", type=float, default=0.0,
                     help="Minimum peak score for reliable dy estimation. Shows diagnostic when below (default: 0=disabled)")
     ap.add_argument("--match-method", type=str, default="phase",
-                    help="Matching method(s): phase, ncc_gray, ncc_edge, phase_gray. Comma-separated (default: phase)")
+                    help="Matching method(s): phase, ncc_gray, ncc_edge, phase_gray, template. Comma-separated (default: phase)")
+    ap.add_argument("--scroll-dir", type=str, default="both", choices=["up", "down", "both"],
+                    help="Scroll direction: up (content moves down), down (content moves up), both (output both candidates, default)")
+    ap.add_argument("--static-bg", action="store_true",
+                    help="Static background mode: use temporal median/min-edge to remove scrolling text (background does not scroll)")
+    ap.add_argument("--static-method", type=str, default="median", choices=["median", "min_edge"],
+                    help="Method for static-bg mode: median (default) or min_edge")
+    ap.add_argument("--uniform-dy", type=float, default=None,
+                    help="Use uniform dy per frame instead of estimation (e.g. -10 for 10px up per frame)")
+    ap.add_argument("--template-region", type=str, default="",
+                    help="Manual template region for template matching: 'y,h,x,w' (e.g. '350,150,750,150')")
 
     ap.add_argument("--ignore", action="append", default=[],
                     help='Ignore region (px): "top,(right|left|X),width,height"  e.g. "0,right,220,120"')
@@ -564,7 +921,63 @@ def main() -> None:
         if s.shape[1] != W or s.shape[0] != Hs:
             raise SystemExit("All strips must have same size")
 
-    # estimate dy between consecutive full frames using multiple methods
+    # Static background mode: use temporal median/min-edge
+    if args.static_bg:
+        print(f"Static background mode: using {args.static_method} method...")
+        out_path = out_dir / f"recon_static_{args.static_method}.png"
+        render_static_background(strips, out_path, method=args.static_method)
+        print(f"\nDone:\n  {out_path}")
+        return
+
+    # Uniform dy mode: skip estimation
+    if args.uniform_dy is not None:
+        uniform_dy = args.uniform_dy
+        print(f"Using uniform dy: {uniform_dy:.1f} per frame")
+        n_frames = len(frames_rgb)
+        dys = [uniform_dy] * (n_frames - 1)
+        peaks = [1.0] * (n_frames - 1)
+
+        pos_dy = [0]
+        pos_negdy = [0]
+        for dy in dys:
+            pos_dy.append(pos_dy[-1] + dy)
+            pos_negdy.append(pos_negdy[-1] - dy)
+
+        # render candidates
+        output_files = []
+        scroll_dir = args.scroll_dir
+        for edge_thr in edge_thrs:
+            suffix = f"_e{edge_thr:.2f}" if len(edge_thrs) > 1 else ""
+            if scroll_dir in ("up", "both"):
+                out1 = out_dir / f"recon_dy{suffix}.png"
+                render_candidate(strips=strips, positions=[int(p) for p in pos_dy], out_path=out1,
+                                 edge_thr=edge_thr, ignore_regions=ignore_regions,
+                                 full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+                output_files.append(out1)
+            if scroll_dir in ("down", "both"):
+                out2 = out_dir / f"recon_negdy{suffix}.png"
+                render_candidate(strips=strips, positions=[int(p) for p in pos_negdy], out_path=out2,
+                                 edge_thr=edge_thr, ignore_regions=ignore_regions,
+                                 full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+                output_files.append(out2)
+
+        csv_path = out_dir / "debug_positions.csv"
+        write_positions_csv(frame_paths, [int(d) for d in dys], peaks,
+                            [int(p) for p in pos_dy], [int(p) for p in pos_negdy], csv_path)
+        print("\nDone:")
+        for f in output_files:
+            print(f"  {f}")
+        print(f"  {csv_path}")
+        return
+
+    # Prepare frames for dy estimation (optionally crop to dy-region)
+    dy_frames = frames_rgb
+    if args.dy_region:
+        dy_y, dy_h = [int(x) for x in args.dy_region.split(",")]
+        print(f"Using dy-region: y={dy_y}, h={dy_h}")
+        dy_frames = [crop_strip(fr, y=dy_y, h=dy_h) for fr in frames_rgb]
+
+    # estimate dy between consecutive frames using multiple methods
     print(f"Estimating dy using method(s): {', '.join(match_methods)}...")
 
     # Store results per method
@@ -573,11 +986,24 @@ def main() -> None:
     for method in match_methods:
         dys: List[int] = []
         peaks: List[float] = []
-        for i in range(1, len(frames_rgb)):
-            results = estimate_dy_multi(frames_rgb[i-1], frames_rgb[i],
+        # Template method needs state tracking
+        template_tracker = None
+        if method == "template":
+            template_tracker = TemplateTracker()
+            # Manual template region if specified
+            if args.template_region:
+                parts = [int(x) for x in args.template_region.split(",")]
+                if len(parts) == 4:
+                    y, h, x, w = parts
+                    template_tracker.regions = [(y, y+h, x, x+w)]
+                    print(f"  Using manual template region: y={y}, h={h}, x={x}, w={w}")
+
+        for i in range(1, len(dy_frames)):
+            results = estimate_dy_multi(dy_frames[i-1], dy_frames[i],
                                         ignore_regions=ignore_regions,
                                         search=args.dy_search,
-                                        methods=[method])
+                                        methods=[method],
+                                        template_tracker=template_tracker)
             if results:
                 r = results[0]
                 dys.append(r.dy)
@@ -585,6 +1011,12 @@ def main() -> None:
             else:
                 dys.append(0)
                 peaks.append(0.0)
+
+        # Template method: detect outliers and interpolate
+        if method == "template":
+            dys = _detect_and_fix_outliers(dys, peaks)
+            dys = _interpolate_lost_tracking(dys, peaks)
+
         method_results[method] = (dys, peaks)
 
     # Use first method as primary
@@ -604,17 +1036,23 @@ def main() -> None:
 
     # render candidates for each edge_thr
     output_files = []
+    scroll_dir = args.scroll_dir
     for edge_thr in edge_thrs:
         suffix = f"_e{edge_thr:.2f}" if len(edge_thrs) > 1 else ""
-        out1 = out_dir / f"recon_dy{suffix}.png"
-        out2 = out_dir / f"recon_negdy{suffix}.png"
-        render_candidate(strips=strips, positions=pos_dy, out_path=out1,
-                         edge_thr=edge_thr, ignore_regions=ignore_regions,
-                         full_w=full_w, full_h=full_h, strip_y=args.strip_y)
-        render_candidate(strips=strips, positions=pos_negdy, out_path=out2,
-                         edge_thr=edge_thr, ignore_regions=ignore_regions,
-                         full_w=full_w, full_h=full_h, strip_y=args.strip_y)
-        output_files.extend([out1, out2])
+        # up: content moves down (use pos_dy)
+        # down: content moves up (use pos_negdy)
+        if scroll_dir in ("up", "both"):
+            out1 = out_dir / f"recon_dy{suffix}.png"
+            render_candidate(strips=strips, positions=pos_dy, out_path=out1,
+                             edge_thr=edge_thr, ignore_regions=ignore_regions,
+                             full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+            output_files.append(out1)
+        if scroll_dir in ("down", "both"):
+            out2 = out_dir / f"recon_negdy{suffix}.png"
+            render_candidate(strips=strips, positions=pos_negdy, out_path=out2,
+                             edge_thr=edge_thr, ignore_regions=ignore_regions,
+                             full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+            output_files.append(out2)
 
     # If multiple methods, also output candidates per method (using first edge_thr)
     if len(match_methods) > 1:
@@ -627,15 +1065,18 @@ def main() -> None:
                 m_pos_dy.append(m_pos_dy[-1] + dy)
                 m_pos_negdy.append(m_pos_negdy[-1] - dy)
 
-            out1 = out_dir / f"recon_{method}_dy.png"
-            out2 = out_dir / f"recon_{method}_negdy.png"
-            render_candidate(strips=strips, positions=m_pos_dy, out_path=out1,
-                             edge_thr=primary_edge_thr, ignore_regions=ignore_regions,
-                             full_w=full_w, full_h=full_h, strip_y=args.strip_y)
-            render_candidate(strips=strips, positions=m_pos_negdy, out_path=out2,
-                             edge_thr=primary_edge_thr, ignore_regions=ignore_regions,
-                             full_w=full_w, full_h=full_h, strip_y=args.strip_y)
-            output_files.extend([out1, out2])
+            if scroll_dir in ("up", "both"):
+                out1 = out_dir / f"recon_{method}_dy.png"
+                render_candidate(strips=strips, positions=m_pos_dy, out_path=out1,
+                                 edge_thr=primary_edge_thr, ignore_regions=ignore_regions,
+                                 full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+                output_files.append(out1)
+            if scroll_dir in ("down", "both"):
+                out2 = out_dir / f"recon_{method}_negdy.png"
+                render_candidate(strips=strips, positions=m_pos_negdy, out_path=out2,
+                                 edge_thr=primary_edge_thr, ignore_regions=ignore_regions,
+                                 full_w=full_w, full_h=full_h, strip_y=args.strip_y)
+                output_files.append(out2)
 
     # debug csv (include peak scores)
     csv_path = out_dir / "debug_positions.csv"

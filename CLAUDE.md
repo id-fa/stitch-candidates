@@ -128,22 +128,29 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 - `--strip-y` - Top Y of horizontal strip (required)
 - `--strip-h` - Height of strip (default: 100)
 - `--edge-thr` - Edge threshold(s) for text masking (comma-separated)
-- `--match-method` - Matching method: phase, ncc_gray, ncc_edge, phase_gray
+- `--match-method` - Matching method: phase, ncc_gray, ncc_edge, phase_gray, template
 - `--min-peak` - Peak score threshold for diagnostics
 - `--ignore` / `--ignore-pct` - Ignore regions (same format as stitch_candidates)
+- `--scroll-dir` - Scroll direction: up, down, both (default: both)
+- `--static-bg` - Static background mode (use temporal median to remove scrolling text)
+- `--static-method` - Method for static-bg: median (default) or min_edge
+- `--dy-region "y,h"` - Region for dy estimation (e.g., "0,200" for top 200px)
+- `--uniform-dy` - Use uniform dy per frame (e.g., -50 for 50px up per frame)
+- `--template-region "y,h,x,w"` - Manual template region for template matching
 
 ### Output Files
 
 - `recon_dy.png` - Result using dy as-is
 - `recon_negdy.png` - Result using negated dy
 - `recon_dy_e0.XX.png` - Result with specific edge-thr
+- `recon_static_median.png` - Result from static-bg mode
 - `debug_positions.csv` - Per-frame dy estimation with peak scores
 
 ### Architecture
 
 - Extracts horizontal strip from each frame
-- Estimates dy (vertical shift) using phase correlation on edge maps
-- Outputs both dy and -dy candidates (sign can be inverted)
+- Estimates dy (vertical shift) using various methods
+- Outputs both dy and -dy candidates (or single direction with --scroll-dir)
 - Text removal: pixels with high edge strength are masked, background-like pixels prioritized
 
 ### Matching Methods
@@ -152,3 +159,34 @@ python video_strip_reconstruct.py --frames "frames/*.png" \
 - `phase_gray` - Phase correlation on grayscale
 - `ncc_gray` - NCC on grayscale (slower but robust)
 - `ncc_edge` - NCC on edge map
+- `template` - Template matching with automatic tracking (best for scrolling backgrounds)
+
+### Scenarios and Recommended Approaches
+
+**Scenario A: Background scrolls, text is static (appears/disappears)**
+- Use `--match-method template` for accurate dy estimation
+- Template tracking follows distinctive features across frames
+- May need `--template-region` for manual template specification
+- Outlier detection and interpolation handle tracking loss
+
+**Scenario B: Background is static, text scrolls**
+- Use `--static-bg --static-method median` for temporal median filtering
+- Works when text passes quickly and background is visible in some frames
+
+**Scenario C: Both background and text scroll together**
+- Original use case, `--match-method phase` works well
+- Use `--ignore` to exclude text regions from dy estimation
+
+### Known Limitations
+
+- Phase correlation may fail with repetitive patterns (e.g., floral decorations)
+- Template tracking loses target when feature exits frame (interpolation helps)
+- Higher fps improves tracking accuracy (more frames = smaller dy per frame)
+- Accumulated small errors in dy estimation can cause visible artifacts
+
+### Workflow for Difficult Cases
+
+1. Start with `--match-method template` for initial dy estimation
+2. Check `debug_positions.csv` for outliers or tracking loss (score drops)
+3. If needed, manually adjust dy values in Python script
+4. Or use `--uniform-dy` if scroll speed is constant
