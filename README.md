@@ -97,12 +97,13 @@ python stitch_candidates.py -m snake --cols 4 -o out img/*.png
 | `--ignore` | 無視領域 (px) | Ignore region (px) |
 | `--ignore-pct` | 無視領域 (%) | Ignore region (%) |
 | `--min-overlap-ratio` | 実効オーバーラップ比率の下限 (default: 0.3) | Minimum effective overlap ratio (default: 0.3) |
-| `--min-boundary-score` | 境界一致度(SSIM)の下限 (default: 0, 無効) | Minimum boundary similarity (default: 0, disabled) |
+| `--min-boundary-score` | 境界一致度(SSIM)の下限 (default: 0.3) | Minimum boundary similarity (default: 0.3) |
 | `--exclude-method` | 除外するメソッド (例: ssim) | Exclude methods (e.g., ssim) |
 | `--refine-from` | 微調整の基準となる候補画像 | Candidate image for refinement |
 | `--refine-delta` | 微調整時の探索範囲 ±n px | Search range ±n px for refinement |
 | `--overlap-scan` | overlap範囲スキャン: MIN,MAX,STEP | Scan overlap range: MIN,MAX,STEP |
-| `--top-n` | スキャンモードで出力する上位N件 (default: 5) | Top N candidates in scan mode (default: 5) |
+| `--overlap-auto` | 3段階階層探索 (step 100→10→1) | 3-stage hierarchical search (step 100→10→1) |
+| `--top-n` | スキャン/オートモードで出力する上位N件 (default: 5) | Top N candidates in scan/auto mode (default: 5) |
 
 ---
 
@@ -153,11 +154,28 @@ overlap範囲を自動スキャンして、スコアの高い上位N件を出力
 Automatically scans overlap range and outputs top N candidates by score.
 
 ```bash
+# 手動範囲指定 / Manual range
 python stitch_candidates.py -m v -o out \
   --overlap-scan 50,150,5 \
   --top-n 5 \
   img/*.png
+
+# 全自動3段階探索 / Fully automatic 3-stage search
+python stitch_candidates.py -m v -o out \
+  --overlap-auto \
+  --top-n 5 \
+  img/*.png
 ```
+
+**`--overlap-auto` の動作 / How --overlap-auto works:**
+
+1. **Stage 1**: 0〜画像高さをステップ100で粗く走査 → 上位3エリア特定
+2. **Stage 2**: 各エリア±50px周辺をステップ10で走査 → 上位3エリア特定
+3. **Stage 3**: 各エリア±5px周辺をステップ1で精密走査 → 最終結果出力
+
+1. **Stage 1**: Coarse scan 0 to image height, step 100 → Top 3 areas
+2. **Stage 2**: Scan ±50px around each area, step 10 → Top 3 areas
+3. **Stage 3**: Fine scan ±5px around each area, step 1 → Final output
 
 **スコアリング / Scoring:**
 
@@ -168,6 +186,7 @@ python stitch_candidates.py -m v -o out \
 
 ```
 scan_rank01_score0.892_ov120__phase__band30__srch10__p1_dx0_dy-2.png
+auto_rank01_score0.892_ov120__phase__band30__srch10__p1_dx0_dy-2.png
 ```
 
 ---

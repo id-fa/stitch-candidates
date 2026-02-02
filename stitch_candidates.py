@@ -3,8 +3,6 @@
 """
 stitch_candidates.py
 
-stitch_candidates1.py と stitch_candidates2.py の統合版。
-
 機能:
 - 複数のマッチング手法 (phase correlation, NCC gray, NCC edge)
 - 垂直/水平/スネーク(zigzag)モード
@@ -877,32 +875,26 @@ class ScanResult:
     composite: np.ndarray
 
 
-def run_overlap_scan(images: List[np.ndarray], mode: str, out_dir: Path,
-                     overlap_min: int, overlap_max: int, overlap_step: int,
-                     bands: List[int], searches: List[int],
-                     methods: List[Method], ignore_regions: List[IgnoreRegion],
-                     min_overlap_ratio: float, min_boundary_score: float, top_n: int) -> None:
+def _scan_overlaps_core(images: List[np.ndarray], mode: str,
+                        overlaps: List[int], bands: List[int], searches: List[int],
+                        methods: List[Method], ignore_regions: List[IgnoreRegion],
+                        min_overlap_ratio: float, min_boundary_score: float,
+                        verbose: bool = True) -> Tuple[List[ScanResult], List[AttemptInfo]]:
     """
-    overlap範囲をスキャンして、スコアが高い上位N件を出力する。
+    指定された overlap 値でスキャンし、結果を返す（コアロジック）。
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     results: List[ScanResult] = []
-    overlaps = list(range(overlap_min, overlap_max + 1, overlap_step))
-
-    print(f"Scanning overlaps: {overlap_min}-{overlap_max} step {overlap_step} ({len(overlaps)} values)")
-    print(f"Methods: {[m.name for m in methods]}, Bands: {bands}, Searches: {searches}")
+    failed_attempts: List[AttemptInfo] = []
 
     total = len(overlaps) * len(bands) * len(searches) * len(methods)
     count = 0
-    failed_attempts: List[AttemptInfo] = []
 
     for overlap in overlaps:
         for band in bands:
             for search in searches:
                 for method in methods:
                     count += 1
-                    if count % 50 == 0:
+                    if verbose and count % 50 == 0:
                         print(f"  Progress: {count}/{total} ({100*count//total}%)")
 
                     comp: Optional[np.ndarray] = images[0]
@@ -979,6 +971,29 @@ def run_overlap_scan(images: List[np.ndarray], mode: str, out_dir: Path,
                         composite=comp,
                     ))
 
+    return results, failed_attempts
+
+
+def run_overlap_scan(images: List[np.ndarray], mode: str, out_dir: Path,
+                     overlap_min: int, overlap_max: int, overlap_step: int,
+                     bands: List[int], searches: List[int],
+                     methods: List[Method], ignore_regions: List[IgnoreRegion],
+                     min_overlap_ratio: float, min_boundary_score: float, top_n: int) -> None:
+    """
+    overlap範囲をスキャンして、スコアが高い上位N件を出力する。
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    overlaps = list(range(overlap_min, overlap_max + 1, overlap_step))
+
+    print(f"Scanning overlaps: {overlap_min}-{overlap_max} step {overlap_step} ({len(overlaps)} values)")
+    print(f"Methods: {[m.name for m in methods]}, Bands: {bands}, Searches: {searches}")
+
+    results, failed_attempts = _scan_overlaps_core(
+        images, mode, overlaps, bands, searches, methods, ignore_regions,
+        min_overlap_ratio, min_boundary_score, verbose=True
+    )
+
     # 有効な結果がない場合、惜しかったポイントを表示
     if len(results) == 0:
         print(f"\nNo valid candidates found. Here are the best attempts:")
@@ -999,11 +1014,108 @@ def run_overlap_scan(images: List[np.ndarray], mode: str, out_dir: Path,
     print(f"\nTop {len(top_results)} results (out of {len(results)} valid):")
     for rank, r in enumerate(top_results, 1):
         steps = "_".join(f"p{i+1}_dx{dx}_dy{dy}" for i, (dx, dy) in enumerate(r.dx_dy_list))
-        filename = f"scan_rank{rank:02d}_score{r.combined_score:.3f}_ov{r.overlap}__{r.method_name}__band{r.band}__srch{r.search}__{steps}.png"
+        filename = f"scan_rank{rank:02d}_score{r.combined_score:.4f}_ov{r.overlap}__{r.method_name}__band{r.band}__srch{r.search}__{steps}.png"
         save_image(r.composite, out_dir / filename)
         print(f"  {rank}. score={r.combined_score:.4f} (match={r.match_score:.4f}, boundary={r.boundary_score:.4f}) ov={r.overlap} {r.method_name}")
 
     print(f"\nScan mode finished. Top {len(top_results)} candidates in: {out_dir}")
+
+
+def run_overlap_auto(images: List[np.ndarray], mode: str, out_dir: Path,
+                     bands: List[int], searches: List[int],
+                     methods: List[Method], ignore_regions: List[IgnoreRegion],
+                     min_overlap_ratio: float, min_boundary_score: float, top_n: int) -> None:
+    """
+    3段階の階層的スキャンでoverlapを自動探索する。
+
+    1. 0〜画像高さ、ステップ100で粗く走査 → 上位3エリアを特定
+    2. 各エリア周辺をステップ10で走査 → 上位3エリアを特定
+    3. 各エリア周辺をステップ1で走査 → 最終結果を出力
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 画像サイズから探索範囲を決定
+    h, w, _ = images[0].shape
+    max_overlap = h if mode == "v" else w
+
+    print(f"=== Auto Overlap Scan ===")
+    print(f"Image size: {w}x{h}, Max overlap: {max_overlap}")
+    print(f"Methods: {[m.name for m in methods]}, Bands: {bands}, Searches: {searches}")
+
+    # --- 第1段階: ステップ100で粗く走査 ---
+    step1 = 100
+    overlaps1 = list(range(0, max_overlap + 1, step1))
+    print(f"\n[Stage 1] Coarse scan: 0-{max_overlap} step {step1} ({len(overlaps1)} values)")
+
+    results1, _ = _scan_overlaps_core(
+        images, mode, overlaps1, bands, searches, methods, ignore_regions,
+        min_overlap_ratio, min_boundary_score, verbose=True
+    )
+
+    if len(results1) == 0:
+        print("No valid candidates found in stage 1. Try adjusting parameters.")
+        return
+
+    # 上位3エリア（overlap値）を特定
+    results1.sort(key=lambda r: r.combined_score, reverse=True)
+    top3_overlaps1 = sorted(set(r.overlap for r in results1[:3]))
+    print(f"  Top overlaps from stage 1: {top3_overlaps1}")
+
+    # --- 第2段階: ステップ10で中間走査 ---
+    step2 = 10
+    half_range2 = 50  # 前後50pxを探索
+    overlaps2_set: set = set()
+    for ov in top3_overlaps1:
+        for o in range(max(0, ov - half_range2), min(max_overlap, ov + half_range2) + 1, step2):
+            overlaps2_set.add(o)
+    overlaps2 = sorted(overlaps2_set)
+    print(f"\n[Stage 2] Medium scan: {len(overlaps2)} values around {top3_overlaps1}")
+
+    results2, _ = _scan_overlaps_core(
+        images, mode, overlaps2, bands, searches, methods, ignore_regions,
+        min_overlap_ratio, min_boundary_score, verbose=True
+    )
+
+    if len(results2) == 0:
+        print("No valid candidates found in stage 2.")
+        return
+
+    # 上位3エリアを特定
+    results2.sort(key=lambda r: r.combined_score, reverse=True)
+    top3_overlaps2 = sorted(set(r.overlap for r in results2[:3]))
+    print(f"  Top overlaps from stage 2: {top3_overlaps2}")
+
+    # --- 第3段階: ステップ1で精密走査 ---
+    step3 = 1
+    half_range3 = 5  # 前後5pxを探索
+    overlaps3_set: set = set()
+    for ov in top3_overlaps2:
+        for o in range(max(0, ov - half_range3), min(max_overlap, ov + half_range3) + 1, step3):
+            overlaps3_set.add(o)
+    overlaps3 = sorted(overlaps3_set)
+    print(f"\n[Stage 3] Fine scan: {len(overlaps3)} values around {top3_overlaps2}")
+
+    results3, _ = _scan_overlaps_core(
+        images, mode, overlaps3, bands, searches, methods, ignore_regions,
+        min_overlap_ratio, min_boundary_score, verbose=True
+    )
+
+    if len(results3) == 0:
+        print("No valid candidates found in stage 3.")
+        return
+
+    # 最終結果を出力
+    results3.sort(key=lambda r: r.combined_score, reverse=True)
+    top_results = results3[:top_n]
+
+    print(f"\n=== Final Results: Top {len(top_results)} (out of {len(results3)} valid) ===")
+    for rank, r in enumerate(top_results, 1):
+        steps = "_".join(f"p{i+1}_dx{dx}_dy{dy}" for i, (dx, dy) in enumerate(r.dx_dy_list))
+        filename = f"auto_rank{rank:02d}_score{r.combined_score:.4f}_ov{r.overlap}__{r.method_name}__band{r.band}__srch{r.search}__{steps}.png"
+        save_image(r.composite, out_dir / filename)
+        print(f"  {rank}. score={r.combined_score:.4f} (match={r.match_score:.4f}, boundary={r.boundary_score:.4f}) ov={r.overlap} {r.method_name}")
+
+    print(f"\nAuto scan finished. Top {len(top_results)} candidates in: {out_dir}")
 
 
 # -------------------------
@@ -1017,12 +1129,13 @@ Recommended Workflow:
   2. Visual inspect: Find nearly-correct candidate (filename has dx/dy)
   3. Refine:         --refine-from <candidate.png> --refine-delta 2
 
-  Alternative: Use --overlap-scan to auto-find best overlap (outputs top N by score)
+  Alternative: Use --overlap-scan or --overlap-auto to auto-find best overlap
 
 Examples:
   python stitch_candidates.py -m v -o out --overlap 80,120 img/*.png
   python stitch_candidates.py -m v -o out --overlap-pct 0.1,0.15 img/*.png
   python stitch_candidates.py -m v -o out --overlap-scan 50,150,5 --top-n 5 img/*.png
+  python stitch_candidates.py -m v -o out --overlap-auto --top-n 5 img/*.png
   python stitch_candidates.py -m v -o refine --refine-from out/v_ov120__phase__*.png --refine-delta 2 img/*.png
 """
 
@@ -1052,8 +1165,8 @@ def main() -> None:
 
     ap.add_argument("--min-overlap-ratio", type=float, default=0.3,
                     help="Minimum effective overlap ratio (0.0-1.0). Candidates below this are skipped. Default: 0.3")
-    ap.add_argument("--min-boundary-score", type=float, default=0.0,
-                    help="Minimum boundary similarity (SSIM) score (0.0-1.0). Candidates below this are skipped. Default: 0 (disabled)")
+    ap.add_argument("--min-boundary-score", type=float, default=0.3,
+                    help="Minimum boundary similarity (SSIM) score (0.0-1.0). Candidates below this are skipped. Default: 0.3")
 
     # Refine-from mode
     ap.add_argument("--refine-from", default=None,
@@ -1064,8 +1177,10 @@ def main() -> None:
     # Overlap scan mode
     ap.add_argument("--overlap-scan", default=None,
                     help="Scan overlap range: MIN,MAX,STEP (e.g., 50,150,5). Outputs top N by score.")
+    ap.add_argument("--overlap-auto", action="store_true",
+                    help="Auto scan: 3-stage hierarchical search (step 100 -> 10 -> 1).")
     ap.add_argument("--top-n", type=int, default=5,
-                    help="Number of top candidates to output in scan mode. Default: 5")
+                    help="Number of top candidates to output in scan/auto mode. Default: 5")
 
     # Method selection
     ap.add_argument("--exclude-method", default=None,
@@ -1134,6 +1249,43 @@ def main() -> None:
             overlap_min=overlap_min,
             overlap_max=overlap_max,
             overlap_step=overlap_step,
+            bands=bands,
+            searches=searches,
+            methods=methods,
+            ignore_regions=ignore_regions,
+            min_overlap_ratio=args.min_overlap_ratio,
+            min_boundary_score=args.min_boundary_score,
+            top_n=args.top_n,
+        )
+        return
+
+    # Overlap auto mode (3-stage hierarchical search)
+    if args.overlap_auto:
+        bands = parse_int_list(args.band)
+        searches = parse_int_list(args.search)
+        methods = build_methods()
+
+        # Exclude methods
+        if args.exclude_method:
+            exclude = [x.strip().lower() for x in args.exclude_method.split(",")]
+            methods = [m for m in methods if m.name.lower() not in exclude]
+            if not methods:
+                sys.exit("All methods excluded. Available: phase, ncc_gray, ncc_edge")
+            print(f"Using methods: {[m.name for m in methods]}")
+
+        ignore_regions: List[IgnoreRegion] = []
+        for s in args.ignore:
+            ignore_regions.append(parse_ignore_region(s, unit="px"))
+        for s in args.ignore_pct:
+            ignore_regions.append(parse_ignore_region(s, unit="pct"))
+
+        if args.mode == "snake":
+            sys.exit("--overlap-auto does not support snake mode yet")
+
+        run_overlap_auto(
+            images=imgs,
+            mode=args.mode,
+            out_dir=out_dir,
             bands=bands,
             searches=searches,
             methods=methods,

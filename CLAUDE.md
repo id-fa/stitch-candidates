@@ -56,12 +56,13 @@ Key parameters:
 - `--overlap` - Overlap pixels (comma list, e.g., "80,120")
 - `--overlap-pct` - Overlap as ratio 0.01-0.95 (e.g., "0.1,0.15,0.2")
 - `--overlap-scan MIN,MAX,STEP` - Scan overlap range, output top N by score
-- `--top-n` - Number of top candidates in scan mode (default: 5)
+- `--overlap-auto` - 3-stage hierarchical search (step 100 → 10 → 1)
+- `--top-n` - Number of top candidates in scan/auto mode (default: 5)
 - `--band` - Band size for matching (comma list)
 - `--search` - Search range in pixels (comma list)
 - `--ignore` / `--ignore-pct` - Ignore regions (px or %)
 - `--min-overlap-ratio` - Prune by effective overlap ratio (default: 0.3)
-- `--min-boundary-score` - Prune by boundary similarity SSIM (default: 0, disabled)
+- `--min-boundary-score` - Prune by boundary similarity SSIM (default: 0.3)
 - `--exclude-method` - Exclude methods (e.g., "ssim" to speed up)
 - `--refine-from` - Candidate file for local re-search
 - `--refine-delta` - Search range ±n px in refine mode
@@ -72,7 +73,7 @@ Key parameters:
 2. **Visual inspection**: Find nearly-correct candidate (filename contains dx/dy)
 3. **Refinement**: Use `--refine-from` with small `--refine-delta`
 
-Alternative: Use `--overlap-scan 50,150,5 --top-n 5` to auto-find best overlap
+Alternative: Use `--overlap-auto` or `--overlap-scan 50,150,5 --top-n 5` to auto-find best overlap
 
 ## Architecture
 
