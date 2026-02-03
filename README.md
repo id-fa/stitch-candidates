@@ -283,3 +283,10 @@ MIT License
 画像エディタ（Photoshop、GIMP等）との併用を推奨します。
 
 Works best when combined with image editors like Photoshop or GIMP.
+
+---
+
+## 関連 / Link
+
+[AIにつなぎ画像合成（スティッチ）ツールを作ってもらった - ふぁメモ](https://fa.hatenadiary.jp/entry/20260202/1770030091)
+
