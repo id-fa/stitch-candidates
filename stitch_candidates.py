@@ -1093,7 +1093,7 @@ def run_overlap_auto(images: List[np.ndarray], mode: str, out_dir: Path,
         for o in range(max(0, ov - half_range3), min(max_overlap, ov + half_range3) + 1, step3):
             overlaps3_set.add(o)
     overlaps3 = sorted(overlaps3_set)
-    print(f"\n[Stage 3] Fine scan: {len(overlaps3)} values around {top3_overlaps2}")
+    print(f"\n[Stage 3] Fine scan: {len(overlaps3)} values around {top3_overlaps2} (range {overlaps3[0]}-{overlaps3[-1]})")
 
     results3, _ = _scan_overlaps_core(
         images, mode, overlaps3, bands, searches, methods, ignore_regions,
@@ -1179,7 +1179,7 @@ def main() -> None:
                     help="Scan overlap range: MIN,MAX,STEP (e.g., 50,150,5). Outputs top N by score.")
     ap.add_argument("--overlap-auto", action="store_true",
                     help="Auto scan: 3-stage hierarchical search (step 100 -> 10 -> 1).")
-    ap.add_argument("--top-n", type=int, default=5,
+    ap.add_argument("--top-n", type=int, default=6,
                     help="Number of top candidates to output in scan/auto mode. Default: 5")
 
     # Method selection
@@ -1296,6 +1296,43 @@ def main() -> None:
         )
         return
 
+    # If no overlap option specified at all, default to overlap-auto
+    if not args.overlap_pct and not args.overlap:
+        print("No --overlap/--overlap-pct specified, defaulting to --overlap-auto mode")
+        bands = parse_int_list(args.band)
+        searches = parse_int_list(args.search)
+        methods = build_methods()
+
+        if args.exclude_method:
+            exclude = [x.strip().lower() for x in args.exclude_method.split(",")]
+            methods = [m for m in methods if m.name.lower() not in exclude]
+            if not methods:
+                sys.exit("All methods excluded. Available: phase, ncc_gray, ncc_edge")
+            print(f"Using methods: {[m.name for m in methods]}")
+
+        ignore_regions: List[IgnoreRegion] = []
+        for s in args.ignore:
+            ignore_regions.append(parse_ignore_region(s, unit="px"))
+        for s in args.ignore_pct:
+            ignore_regions.append(parse_ignore_region(s, unit="pct"))
+
+        if args.mode == "snake":
+            sys.exit("--overlap-auto does not support snake mode yet")
+
+        run_overlap_auto(
+            images=imgs,
+            mode=args.mode,
+            out_dir=out_dir,
+            bands=bands,
+            searches=searches,
+            methods=methods,
+            ignore_regions=ignore_regions,
+            min_overlap_ratio=args.min_overlap_ratio,
+            min_boundary_score=args.min_boundary_score,
+            top_n=args.top_n,
+        )
+        return
+
     # Normal mode
     # Compute overlaps (px or pct)
     if args.overlap_pct:
@@ -1305,10 +1342,8 @@ def main() -> None:
         ref_size = h if args.mode == "v" else w
         overlaps = compute_overlaps_from_pct(pct_list, ref_size)
         print(f"overlap-pct {pct_list} -> {overlaps} px (ref={ref_size})")
-    elif args.overlap:
-        overlaps = parse_int_list(args.overlap)
     else:
-        overlaps = [0, 10, 20]  # default
+        overlaps = parse_int_list(args.overlap)
 
     bands = parse_int_list(args.band)
     searches = parse_int_list(args.search)
