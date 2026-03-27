@@ -871,6 +871,7 @@ class OutputBrowserTab(ttk.Frame):
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
+        self.listbox.bind("<Delete>", lambda _e: self._delete_selected())
 
         nav = ttk.Frame(self)
         nav.pack(fill=tk.X, padx=4, pady=4)
@@ -879,6 +880,7 @@ class OutputBrowserTab(ttk.Frame):
         self.info_label = ttk.Label(nav, text="")
         self.info_label.pack(side=tk.LEFT, padx=12)
         ttk.Button(nav, text="Open in Explorer", command=self._open_explorer).pack(side=tk.RIGHT)
+        ttk.Button(nav, text="Delete", command=self._delete_selected).pack(side=tk.RIGHT, padx=(0, 8))
 
     def _browse(self):
         d = filedialog.askdirectory(initialdir=_initial_dir(self.dir_var.get()))
@@ -934,6 +936,41 @@ class OutputBrowserTab(ttk.Frame):
         """Programmatically set directory and load."""
         self.dir_var.set(path)
         self._load()
+
+    def _delete_selected(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        paths = [self._images[i] for i in sel]
+        names = [Path(p).name for p in paths]
+        if len(names) == 1:
+            msg = f"{names[0]} をごみ箱に移動しますか？"
+        else:
+            msg = f"{len(names)} 件のファイルをごみ箱に移動しますか？\n" + "\n".join(names[:10])
+            if len(names) > 10:
+                msg += f"\n... 他 {len(names) - 10} 件"
+        if not messagebox.askyesno("Delete", msg):
+            return
+        try:
+            from send2trash import send2trash
+            for p in paths:
+                send2trash(p)
+        except Exception as e:
+            messagebox.showerror("Error", f"削除に失敗しました:\n{e}")
+            return
+        # Update list: remove deleted entries and adjust index
+        for i in reversed(sel):
+            self.listbox.delete(i)
+            del self._images[i]
+        if self._images:
+            self._idx = min(sel[0], len(self._images) - 1)
+            self.listbox.selection_set(self._idx)
+            self.listbox.see(self._idx)
+            self._show_current()
+        else:
+            self._idx = 0
+            self.info_label.configure(text="")
+            self.preview.clear()
 
     def _open_explorer(self):
         d = self.dir_var.get()
