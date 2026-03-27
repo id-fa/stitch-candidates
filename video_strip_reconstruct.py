@@ -3568,7 +3568,7 @@ def show_diagnostics(dys: List[int], peaks: List[float], frame_paths: List[Path]
             print("  -> dy estimation may be unstable")
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -3666,7 +3666,7 @@ def main() -> None:
     ap.add_argument("--ignore-pct", action="append", default=[],
                     help='Ignore region (pct): "top,(right|left|X),width,height"  e.g. "0,right,12,8"')
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     # Handle --no-keyframe-mode flag
     if args.no_keyframe_mode:

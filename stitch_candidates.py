@@ -1140,7 +1140,7 @@ Examples:
 """
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(
         description="Generate stitching candidates (vertical/horizontal/snake) from N images.",
         epilog=WORKFLOW_HELP,
@@ -1186,7 +1186,7 @@ def main() -> None:
     ap.add_argument("--exclude-method", default=None,
                     help="Exclude matching methods (comma list). Available: phase,ncc_gray,ncc_edge,ssim")
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     out_dir = Path(args.out)
 
     # Windows-safe wildcard expansion

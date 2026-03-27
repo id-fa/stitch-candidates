@@ -12,6 +12,7 @@ Image stitching tools for combining scroll/pan screenshots and reconstructing ba
 
 1. **stitch_candidates.py** - Static image stitching (screenshots)
 2. **video_strip_reconstruct.py** - Video background reconstruction with text removal
+3. **gui.py** - tkinter GUI for both tools above
 
 ## Main Script
 
@@ -23,6 +24,31 @@ Image stitching tools for combining scroll/pan screenshots and reconstructing ba
 - refine-from mode for local re-search
 - Overlap scan mode for auto-finding best overlap
 - Score-based pruning (matching score + boundary similarity)
+
+## GUI
+
+`gui.py` - tkinter-based GUI wrapping both stitch_candidates.py and video_strip_reconstruct.py.
+
+```bash
+python gui.py
+```
+
+### Structure
+
+- 3 tabs: **Stitch Candidates**, **Video Reconstruct**, **Output Browser**
+- Bottom panel: log output (left) + image preview (right)
+- Calls `stitch_candidates.main(argv)` / `video_strip_reconstruct.main(argv)` via import (not subprocess)
+- stdout is redirected to the log panel via `_StdoutRedirector` during execution
+- `SystemExit` from `sys.exit()` is caught and displayed as error
+- Run completes → Output Browser auto-loads output directory
+
+### Key design notes
+
+- Both scripts expose `main(argv: Optional[List[str]] = None)` — when `argv` is `None`, they read `sys.argv` (CLI compatible); when a list is passed, they parse that instead
+- GUI builds an argv list from widget state and passes it to `main(argv)`
+- Execution runs in a daemon thread to keep the UI responsive
+- All Browse dialogs use `initialdir` from the current path value
+- Video match method uses checkbox selection (multiple methods possible), not free text
 
 ## Dependencies
 
