@@ -11,8 +11,9 @@ Image stitching tools for combining scroll/pan screenshots and reconstructing ba
 ### Tools
 
 1. **stitch_candidates.py** - Static image stitching (screenshots)
-2. **video_strip_reconstruct.py** - Video background reconstruction with text removal
-3. **gui.py** - tkinter GUI for both tools above
+2. **video_strip_reconstruct.py** - Video background reconstruction with text removal (legacy, sequential model)
+3. **panorama_recon.py** - Video background reconstruction v2: global alignment + temporal median (recommended for video)
+4. **gui.py** - tkinter GUI for all tools above
 
 ## Main Script
 
@@ -27,7 +28,7 @@ Image stitching tools for combining scroll/pan screenshots and reconstructing ba
 
 ## GUI
 
-`gui.py` - tkinter-based GUI wrapping both stitch_candidates.py and video_strip_reconstruct.py.
+`gui.py` - tkinter-based GUI wrapping stitch_candidates.py, video_strip_reconstruct.py and panorama_recon.py.
 
 ```bash
 python gui.py
@@ -35,9 +36,9 @@ python gui.py
 
 ### Structure
 
-- 3 tabs: **Stitch Candidates**, **Video Reconstruct**, **Output Browser**
+- 4 tabs: **Stitch Candidates**, **Video Reconstruct**, **Panorama Reconstruct**, **Output Browser**
 - Bottom panel: log output (left) + image preview (right)
-- Calls `stitch_candidates.main(argv)` / `video_strip_reconstruct.main(argv)` via import (not subprocess)
+- Calls `stitch_candidates.main(argv)` / `video_strip_reconstruct.main(argv)` / `panorama_recon.main(argv)` via import (not subprocess)
 - stdout is redirected to the log panel via `_StdoutRedirector` during execution
 - `SystemExit` from `sys.exit()` is caught and displayed as error
 - Run completes → Output Browser auto-loads output directory
@@ -49,12 +50,16 @@ python gui.py
 - Execution runs in a daemon thread to keep the UI responsive
 - All Browse dialogs use `initialdir` from the current path value
 - Video match method uses checkbox selection (multiple methods possible), not free text
+- Run buttons are `RunButton` (a coloured `tk.Button`; ttk ignores colours on the Windows theme). It greys itself when `state=DISABLED`
+- Drag & drop: `App` derives from `TkinterDnD.Tk` when `tkinterdnd2` is importable (plain `tk.Tk` otherwise). `enable_drop(widget, cb)` registers a drop target; the Video Reconstruct and Panorama tabs accept a video file (→ Video) or a folder / image file (→ Frames glob) on the Input section. PyInstaller picks up tkdnd via the hooks-contrib `hook-tkinterdnd2`
 
 ## Dependencies
 
 ```bash
 pip install pillow numpy
-pip install opencv-python  # optional, improves performance
+pip install opencv-python  # optional, improves performance (required for --video in panorama_recon.py)
+pip install torch          # required only by panorama_recon.py (CUDA build recommended)
+pip install tkinterdnd2    # optional: drag & drop of video files / frame folders onto the GUI
 ```
 
 ## Running
@@ -125,9 +130,80 @@ Scoring (scan mode):
 
 ---
 
-## Video Background Reconstruction
+## Panorama Reconstruction v2 (panorama_recon.py)
+
+`panorama_recon.py` - Recommended tool for video. Replaces the sequential "candidate generation" model with a
+single deterministic answer. Motion model per frame (`--model`): `translation`, `scale` (translation + zoom,
+default), `similarity` (+ rotation). Frame k pixel x maps to canvas X = S[k] R(TH[k]) x + T[k].
+
+```bash
+# Typical (all frames, GPU auto-detected, zoom handled automatically)
+python panorama_recon.py --video input.mp4 --out pano_out
+
+# Subsample long videos
+python panorama_recon.py --video input.mp4 --fps 10 --start 5 --duration 20 --out pano_out
+
+# From extracted frames, CPU only (halve the Gauss-Newton resolution for speed)
+python panorama_recon.py --frames "frames/*.png" --device cpu --fine-scale 0.5 --out pano_out
+
+# Pure pan, fastest path (FFT window search instead of Gauss-Newton)
+python panorama_recon.py --video input.mp4 --model translation --out pano_out
+```
+
+### Pipeline
+
+1. **Static overlay detection** (`--static-span/--static-diff/--static-grad/--static-dilate`):
+   pixels with high gradient whose value does not change between frame i and i±span are
+   screen-fixed overlays (credits, logos). They are excluded from matching and compositing.
+   Check `debug_overlay_mask.png` (red = masked). If mask ratio > 50% the scroll is too slow: raise `--static-span`.
+2. **Coarse alignment**: masked NCC (FFT, Padfield) over the full shift range at `--coarse-scale` (default 0.25)
+   for every pair (i, i+k), k in `--pairs` (default 1,2,4). With `scale`/`similarity` models the NCC is evaluated
+   on a log-scale grid (`--scale-max` 0.06, `--scale-step` 0.004) for k=1 pairs; larger k pairs search only ±3
+   steps around the chain prediction.
+3. **Fine alignment**:
+   - `translation`: full-resolution masked NCC in a small window around the coarse estimate, parabolic subpixel.
+   - `scale`/`similarity`: Gauss-Newton direct alignment on high-passed images (pyramid 0.25 → 0.5 → `--fine-scale`),
+     masked, Huber-weighted, `--gn-iters` per level. Pairs inconsistent with the coarse global solution are
+     re-initialised from the predicted transform. A second pass re-refines pairs with residual > 1.5 px.
+4. **Global solve**: log-scale, angle and translation are solved jointly by IRLS least squares (Cauchy weights),
+   so errors do not accumulate. Residuals > 1.5 px are reported in the log and `pairs.csv`. Frame 0 is the reference
+   (scale 1, angle 0, position 0).
+5. **Render** (row bands of `--band` rows, GPU): every frame is warped (similarity, bilinear; Gaussian prefilter
+   when downscaled) to the canvas. `--canvas-scale auto` makes the most zoomed-in frame 1:1 (max detail; a
+   zoom-out video therefore yields a canvas larger than the frame); a number sets the scale relative to frame 0.
+   Then per pixel:
+   - `recon_median.png` - temporal median of non-overlay samples (most robust, removes text/sparkles)
+   - `recon_mean.png` - mean of inliers within `--inlier-tol` of the median (least noise)
+   - `recon_sharp.png` - mean of the top `--sharp-top` fraction of inliers by local sharpness (crispest)
+   - `coverage.png` - per-pixel count of clean samples (dark = few samples, check edges here)
+
+### Outputs
+
+- `recon_median.png`, `recon_mean.png`, `recon_sharp.png`, `coverage.png`
+- `positions.csv` - per-frame scale, theta_deg, x, y (frame 0 = reference), subpixel
+- `pairs.csv` - per-pair scale, theta_deg, tx, ty, NCC score, residual after global solve
+- `debug_overlay_mask.png` - first/middle/last frame with overlay mask in red
+
+### Notes
+
+- Timings on an RTX 3080 Ti, 1080p 30 fps: sample.mp4 (135 frames, pan) ~55 s with `scale`, ~25 s with
+  `translation`; sample3_zoom.mp4 (86 frames, pan + 1.9x zoom-out) ~48 s; sample2_jigzag.mp4 (133 frames) ~51 s.
+- Direction (vertical/horizontal) is not a parameter: 2D shift is estimated directly.
+- Character animation inside the shot (blinks, body motion) makes pairs across the change score ~0.6-0.7 and leaves
+  residuals of a few px on those pairs; the median rendering absorbs it. Duplicate frames (24→30 fps pulldown) are
+  harmless (pair shift ≈ 0).
+- Frame-rate: keep the native 30 fps for zoom videos; at 6 fps the per-pair scale change can exceed `--scale-max`
+  and frames lose overlap.
+- `--ignore-rect x,y,w,h` adds always-excluded regions (semicolon-separated in the GUI).
+- If a static logo sits at a canvas edge covered only by frames where it is masked, the render falls back to the
+  unmasked median there (logo remains). `coverage.png` shows such regions as dark.
+
+---
+
+## Video Background Reconstruction (legacy)
 
 `video_strip_reconstruct.py` - Reconstructs backgrounds from vertical scrolling videos while removing text overlays.
+Superseded by `panorama_recon.py` for most cases; kept for the strip/keyframe/template workflows below.
 
 ### Running
 

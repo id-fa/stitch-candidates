@@ -25,7 +25,73 @@ try:
 except ImportError:
     HAS_PIL = False
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
+    HAS_DND = True
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
+    HAS_DND = False
+
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".m4v", ".ts", ".wmv"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def _parse_drop_paths(widget, data: str) -> List[str]:
+    """Parse the tkinterdnd2 drop payload into a list of paths."""
+    try:
+        return [str(p) for p in widget.tk.splitlist(data)]
+    except Exception:
+        return [data.strip("{}")]
+
+
+def enable_drop(widget, on_paths: Callable[[List[str]], None]) -> None:
+    """Accept file/folder drops on *widget* (no-op if tkinterdnd2 is unavailable)."""
+    if not HAS_DND:
+        return
+    try:
+        widget.drop_target_register(DND_FILES)
+        widget.dnd_bind("<<Drop>>", lambda e: on_paths(_parse_drop_paths(widget, e.data)))
+    except Exception:
+        pass
+
+
+def frames_glob_from_paths(paths: List[str]) -> Optional[str]:
+    """Folder → folder/*.png (or the dominant image extension); image file → its folder glob."""
+    for p in paths:
+        pp = Path(p)
+        if pp.is_dir():
+            exts = [q.suffix.lower() for q in pp.iterdir() if q.suffix.lower() in IMAGE_EXTS]
+            ext = max(set(exts), key=exts.count) if exts else ".png"
+            return str(pp / f"*{ext}")
+        if pp.suffix.lower() in IMAGE_EXTS:
+            return str(pp.parent / f"*{pp.suffix.lower()}")
+    return None
+
+
+class RunButton(tk.Button):
+    """Large, coloured primary action button (tk.Button so the colour shows on every theme)."""
+
+    NORMAL_BG = "#2e7d32"
+    ACTIVE_BG = "#1b5e20"
+    DISABLED_BG = "#9e9e9e"
+
+    def __init__(self, master, text: str, command: Callable[[], None], **kw):
+        super().__init__(
+            master, text="\u25b6  " + text, command=command,
+            bg=self.NORMAL_BG, fg="white", activebackground=self.ACTIVE_BG, activeforeground="white",
+            disabledforeground="#eeeeee", font=("Segoe UI", 11, "bold"),
+            padx=18, pady=6, relief=tk.RAISED, bd=2, cursor="hand2", **kw)
+
+    def configure(self, cnf=None, **kw):
+        state = kw.get("state", cnf.get("state") if isinstance(cnf, dict) else None)
+        if state is not None:
+            kw["bg"] = self.DISABLED_BG if str(state) == tk.DISABLED else self.NORMAL_BG
+        return super().configure(cnf, **kw)
+
+    config = configure
 
 
 def _initial_dir(path_str: str) -> Optional[str]:
@@ -329,7 +395,7 @@ class StitchTab(ttk.Frame):
         # Run button (top)
         btn_frame = ttk.Frame(pf)
         btn_frame.pack(fill=tk.X, padx=4, pady=(4, 8))
-        self.run_btn = ttk.Button(btn_frame, text="Run Stitch", command=self._run)
+        self.run_btn = RunButton(btn_frame, "Run Stitch", self._run)
         self.run_btn.pack(side=tk.LEFT)
 
         # Mode
@@ -543,7 +609,7 @@ class VideoTab(ttk.Frame):
         # Run button (top)
         btn_frame = ttk.Frame(pf)
         btn_frame.pack(fill=tk.X, padx=4, pady=(4, 8))
-        self.run_btn = ttk.Button(btn_frame, text="Run Reconstruct", command=self._run)
+        self.run_btn = RunButton(btn_frame, "Run Reconstruct", self._run)
         self.run_btn.pack(side=tk.LEFT)
 
         # --- Input ---
@@ -554,15 +620,24 @@ class VideoTab(ttk.Frame):
         vf.pack(fill=tk.X, padx=4, pady=2)
         self.video_var = tk.StringVar()
         ttk.Label(vf, text="Video:").pack(side=tk.LEFT)
-        ttk.Entry(vf, textvariable=self.video_var, width=40).pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        video_entry = ttk.Entry(vf, textvariable=self.video_var, width=40)
+        video_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
         ttk.Button(vf, text="Browse...", command=self._browse_video).pack(side=tk.LEFT)
+        for w in (f, vf, video_entry):
+            enable_drop(w, self._on_drop_input)
 
         ff = ttk.Frame(f)
         ff.pack(fill=tk.X, padx=4, pady=2)
         self.frames_var = tk.StringVar()
         ttk.Label(ff, text="Frames glob:").pack(side=tk.LEFT)
-        ttk.Entry(ff, textvariable=self.frames_var, width=40).pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        frames_entry = ttk.Entry(ff, textvariable=self.frames_var, width=40)
+        frames_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
         ttk.Button(ff, text="Browse folder...", command=self._browse_frames_dir).pack(side=tk.LEFT)
+        for w in (ff, frames_entry):
+            enable_drop(w, self._on_drop_input)
+        if HAS_DND:
+            ttk.Label(f, text="Drop a video file or a frames folder here", foreground="#666666").pack(
+                anchor=tk.W, padx=8, pady=(0, 2))
 
         ef = ttk.Frame(f)
         ef.pack(fill=tk.X, padx=4, pady=2)
@@ -704,6 +779,22 @@ class VideoTab(ttk.Frame):
         if f:
             self.video_var.set(f)
 
+    def _on_drop_input(self, paths: List[str]):
+        """Dropped video file → Video; dropped folder / image file → Frames glob."""
+        for p in paths:
+            if Path(p).is_file() and Path(p).suffix.lower() in VIDEO_EXTS:
+                self.video_var.set(p)
+                self.frames_var.set("")
+                return
+        g = frames_glob_from_paths(paths)
+        if g:
+            self.frames_var.set(g)
+            self.video_var.set("")
+            return
+        if paths and Path(paths[0]).is_file():
+            self.video_var.set(paths[0])
+            self.frames_var.set("")
+
     def _browse_frames_dir(self):
         d = filedialog.askdirectory(initialdir=_initial_dir(self.frames_var.get()))
         if d:
@@ -821,6 +912,302 @@ class VideoTab(ttk.Frame):
 
         from video_strip_reconstruct import main as vsr_main
         run_with_capture(vsr_main, argv, self.log.append, self._on_done, self.app)
+
+    def _on_done(self, error: Optional[str]):
+        self._running = False
+        self.run_btn.configure(state=tk.NORMAL)
+        if error:
+            self.log.append(f"\n--- Error ---\n{error}\n")
+        else:
+            self.log.append("\n--- Finished ---\n")
+            self._load_output_browser()
+
+    def _load_output_browser(self):
+        out_dir = Path(self.out_var.get())
+        if not out_dir.is_absolute():
+            out_dir = SCRIPT_DIR / out_dir
+        if out_dir.exists():
+            self.app.output_tab.load_dir(str(out_dir))
+            self.app.notebook.select(self.app.output_tab)
+
+
+# ============================================================
+# Panorama Reconstruct Tab (panorama_recon.py)
+# ============================================================
+
+class PanoramaTab(ttk.Frame):
+    """Global-alignment + temporal-median reconstruction (panorama_recon.py)."""
+
+    def __init__(self, master, log: LogPanel, preview: ImagePreview, app: "App", **kw):
+        super().__init__(master, **kw)
+        self.log = log
+        self.preview = preview
+        self.app = app
+        self._running = False
+        self._build()
+
+    def _build(self):
+        canvas = tk.Canvas(self, highlightthickness=0)
+        vsb = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
+        self._param_frame = ttk.Frame(canvas)
+        self._param_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self._param_frame, anchor=tk.NW)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        pf = self._param_frame
+
+        btn_frame = ttk.Frame(pf)
+        btn_frame.pack(fill=tk.X, padx=4, pady=(4, 8))
+        self.run_btn = RunButton(btn_frame, "Run Panorama Reconstruct", self._run)
+        self.run_btn.pack(side=tk.LEFT)
+        ttk.Label(btn_frame, text="  Global alignment + temporal median (pan + zoom, GPU if available)").pack(side=tk.LEFT)
+
+        # --- Input ---
+        f = ttk.LabelFrame(pf, text="Input")
+        f.pack(fill=tk.X, padx=4, pady=2)
+
+        vf = ttk.Frame(f)
+        vf.pack(fill=tk.X, padx=4, pady=2)
+        self.video_var = tk.StringVar()
+        ttk.Label(vf, text="Video:").pack(side=tk.LEFT)
+        video_entry = ttk.Entry(vf, textvariable=self.video_var, width=40)
+        video_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        ttk.Button(vf, text="Browse...", command=self._browse_video).pack(side=tk.LEFT)
+        for w in (f, vf, video_entry):
+            enable_drop(w, self._on_drop_input)
+
+        ff = ttk.Frame(f)
+        ff.pack(fill=tk.X, padx=4, pady=2)
+        self.frames_var = tk.StringVar()
+        ttk.Label(ff, text="Frames glob:").pack(side=tk.LEFT)
+        frames_entry = ttk.Entry(ff, textvariable=self.frames_var, width=40)
+        frames_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        ttk.Button(ff, text="Browse folder...", command=self._browse_frames_dir).pack(side=tk.LEFT)
+        for w in (ff, frames_entry):
+            enable_drop(w, self._on_drop_input)
+        if HAS_DND:
+            ttk.Label(f, text="Drop a video file or a frames folder here", foreground="#666666").pack(
+                anchor=tk.W, padx=8, pady=(0, 2))
+
+        ef = ttk.Frame(f)
+        ef.pack(fill=tk.X, padx=4, pady=2)
+        self.fps_entry = LabeledEntry(ef, "FPS:", "", width=8, tooltip="Empty = use every N-th frame")
+        self.fps_entry.pack(side=tk.LEFT)
+        self.every_entry = LabeledEntry(ef, "Every N:", "1", width=6, tooltip="Use every N-th frame (ignored if FPS set)")
+        self.every_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.start_entry = LabeledEntry(ef, "Start (s):", "", width=8)
+        self.start_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.dur_entry = LabeledEntry(ef, "Duration (s):", "", width=8)
+        self.dur_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.max_frames_entry = LabeledEntry(ef, "Max frames:", "", width=6)
+        self.max_frames_entry.pack(side=tk.LEFT, padx=(12, 0))
+
+        # --- Output ---
+        f = ttk.LabelFrame(pf, text="Output")
+        f.pack(fill=tk.X, padx=4, pady=2)
+        of = ttk.Frame(f)
+        of.pack(fill=tk.X, padx=4)
+        self.out_var = tk.StringVar(value="pano_out")
+        ttk.Label(of, text="Output dir:").pack(side=tk.LEFT)
+        ttk.Entry(of, textvariable=self.out_var, width=30).pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        ttk.Button(of, text="Browse...", command=self._browse_out).pack(side=tk.LEFT)
+        df = ttk.Frame(f)
+        df.pack(fill=tk.X, padx=4, pady=2)
+        ttk.Label(df, text="Device:").pack(side=tk.LEFT)
+        self.device_var = tk.StringVar(value="auto")
+        for d in ("auto", "cuda", "cpu"):
+            ttk.Radiobutton(df, text=d, variable=self.device_var, value=d).pack(side=tk.LEFT, padx=6)
+        self.no_render_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(df, text="Positions only (no render)", variable=self.no_render_var).pack(side=tk.LEFT, padx=(12, 0))
+
+        # --- Alignment ---
+        f = ttk.LabelFrame(pf, text="Alignment")
+        f.pack(fill=tk.X, padx=4, pady=2)
+        mf = ttk.Frame(f)
+        mf.pack(fill=tk.X, padx=4, pady=2)
+        ttk.Label(mf, text="Model:").pack(side=tk.LEFT)
+        self.model_var = tk.StringVar(value="scale")
+        for m, lbl in (("translation", "Translation"), ("scale", "Scale (zoom)"), ("similarity", "Similarity (+rotation)")):
+            ttk.Radiobutton(mf, text=lbl, variable=self.model_var, value=m).pack(side=tk.LEFT, padx=6)
+        zf = ttk.Frame(f)
+        zf.pack(fill=tk.X, padx=4, pady=2)
+        self.scale_max_entry = LabeledEntry(zf, "Scale max:", "0.06", width=6,
+                                            tooltip="Max log-scale difference per pair in coarse search (0.06 = about 6%)")
+        self.scale_max_entry.pack(side=tk.LEFT)
+        self.scale_step_entry = LabeledEntry(zf, "Scale step:", "0.004", width=6)
+        self.scale_step_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.fine_scale_entry = LabeledEntry(zf, "Fine scale:", "1.0", width=5,
+                                             tooltip="Final resolution factor of Gauss-Newton refinement (0.5 recommended on CPU)")
+        self.fine_scale_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.gn_iters_entry = LabeledEntry(zf, "GN iters:", "15", width=5)
+        self.gn_iters_entry.pack(side=tk.LEFT, padx=(12, 0))
+        af = ttk.Frame(f)
+        af.pack(fill=tk.X, padx=4)
+        self.pairs_entry = LabeledEntry(af, "Pair offsets:", "1,2,4", width=10,
+                                        tooltip="Frame gaps used for pairwise matching (comma list)")
+        self.pairs_entry.pack(side=tk.LEFT)
+        self.coarse_scale_entry = LabeledEntry(af, "Coarse scale:", "0.25", width=6)
+        self.coarse_scale_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.min_overlap_entry = LabeledEntry(af, "Min overlap:", "0.15", width=6,
+                                              tooltip="Minimum overlap ratio in coarse search")
+        self.min_overlap_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.ignore_rect_entry = LabeledEntry(f, "Ignore rects (x,y,w,h; ...):", "",
+                                              tooltip="Always-excluded rectangles, semicolon separated")
+        self.ignore_rect_entry.pack(fill=tk.X, padx=4)
+
+        # --- Static overlay ---
+        f = ttk.LabelFrame(pf, text="Static Overlay Detection (credits / logos)")
+        f.pack(fill=tk.X, padx=4, pady=2)
+        sf = ttk.Frame(f)
+        sf.pack(fill=tk.X, padx=4)
+        self.static_mask_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(sf, text="Enable", variable=self.static_mask_var).pack(side=tk.LEFT)
+        self.static_span_entry = LabeledEntry(sf, "Span:", "6", width=5,
+                                              tooltip="Frame gap used for temporal difference (increase for slow scroll)")
+        self.static_span_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.static_diff_entry = LabeledEntry(sf, "Diff:", "0.03", width=6)
+        self.static_diff_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.static_grad_entry = LabeledEntry(sf, "Grad:", "0.08", width=6)
+        self.static_grad_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.static_dilate_entry = LabeledEntry(sf, "Dilate:", "7", width=5)
+        self.static_dilate_entry.pack(side=tk.LEFT, padx=(12, 0))
+
+        # --- Render ---
+        f = ttk.LabelFrame(pf, text="Render")
+        f.pack(fill=tk.X, padx=4, pady=2)
+        rf = ttk.Frame(f)
+        rf.pack(fill=tk.X, padx=4)
+        self.inlier_tol_entry = LabeledEntry(rf, "Inlier tol:", "0.06", width=6,
+                                             tooltip="Max distance from median (0-1) for mean/sharp outputs")
+        self.inlier_tol_entry.pack(side=tk.LEFT)
+        self.sharp_top_entry = LabeledEntry(rf, "Sharp top ratio:", "0.3", width=6,
+                                            tooltip="Fraction of sharpest inliers averaged in recon_sharp")
+        self.sharp_top_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.band_entry = LabeledEntry(rf, "Band rows:", "64", width=6, tooltip="Lower if out of GPU memory")
+        self.band_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.canvas_scale_entry = LabeledEntry(rf, "Canvas scale:", "auto", width=6,
+                                               tooltip="auto = most zoomed-in frame at 1:1; or a number relative to frame 0")
+        self.canvas_scale_entry.pack(side=tk.LEFT, padx=(12, 0))
+
+    def _browse_video(self):
+        f = filedialog.askopenfilename(
+            filetypes=[("Video", "*.mp4 *.avi *.mkv *.mov *.webm"), ("All", "*.*")],
+            initialdir=_initial_dir(self.video_var.get())
+        )
+        if f:
+            self.video_var.set(f)
+
+    def _on_drop_input(self, paths: List[str]):
+        """Dropped video file → Video; dropped folder / image file → Frames glob."""
+        for p in paths:
+            if Path(p).is_file() and Path(p).suffix.lower() in VIDEO_EXTS:
+                self.video_var.set(p)
+                self.frames_var.set("")
+                return
+        g = frames_glob_from_paths(paths)
+        if g:
+            self.frames_var.set(g)
+            self.video_var.set("")
+            return
+        if paths and Path(paths[0]).is_file():
+            self.video_var.set(paths[0])
+            self.frames_var.set("")
+
+    def _browse_frames_dir(self):
+        d = filedialog.askdirectory(initialdir=_initial_dir(self.frames_var.get()))
+        if d:
+            self.frames_var.set(str(Path(d) / "*.png"))
+
+    def _browse_out(self):
+        d = filedialog.askdirectory(initialdir=_initial_dir(self.out_var.get()))
+        if d:
+            self.out_var.set(d)
+
+    def _build_argv(self) -> List[str]:
+        """Build argv list for panorama_recon.main(argv)."""
+        argv: List[str] = []
+        if self.video_var.get():
+            argv += ["--video", self.video_var.get()]
+        elif self.frames_var.get():
+            argv += ["--frames", self.frames_var.get()]
+        argv += ["--out", self.out_var.get()]
+        argv += ["--device", self.device_var.get()]
+
+        if self.fps_entry.get():
+            argv += ["--fps", self.fps_entry.get()]
+        if self.every_entry.get():
+            argv += ["--every", self.every_entry.get()]
+        if self.start_entry.get():
+            argv += ["--start", self.start_entry.get()]
+        if self.dur_entry.get():
+            argv += ["--duration", self.dur_entry.get()]
+        if self.max_frames_entry.get():
+            argv += ["--max-frames", self.max_frames_entry.get()]
+        if self.no_render_var.get():
+            argv += ["--no-render"]
+
+        argv += ["--model", self.model_var.get()]
+        if self.scale_max_entry.get():
+            argv += ["--scale-max", self.scale_max_entry.get()]
+        if self.scale_step_entry.get():
+            argv += ["--scale-step", self.scale_step_entry.get()]
+        if self.fine_scale_entry.get():
+            argv += ["--fine-scale", self.fine_scale_entry.get()]
+        if self.gn_iters_entry.get():
+            argv += ["--gn-iters", self.gn_iters_entry.get()]
+        if self.canvas_scale_entry.get():
+            argv += ["--canvas-scale", self.canvas_scale_entry.get()]
+        if self.pairs_entry.get():
+            argv += ["--pairs", self.pairs_entry.get()]
+        if self.coarse_scale_entry.get():
+            argv += ["--coarse-scale", self.coarse_scale_entry.get()]
+        if self.min_overlap_entry.get():
+            argv += ["--min-overlap", self.min_overlap_entry.get()]
+        for rect in self.ignore_rect_entry.get().split(";"):
+            rect = rect.strip()
+            if rect:
+                argv += ["--ignore-rect", rect]
+
+        if not self.static_mask_var.get():
+            argv += ["--no-static-mask"]
+        if self.static_span_entry.get():
+            argv += ["--static-span", self.static_span_entry.get()]
+        if self.static_diff_entry.get():
+            argv += ["--static-diff", self.static_diff_entry.get()]
+        if self.static_grad_entry.get():
+            argv += ["--static-grad", self.static_grad_entry.get()]
+        if self.static_dilate_entry.get():
+            argv += ["--static-dilate", self.static_dilate_entry.get()]
+
+        if self.inlier_tol_entry.get():
+            argv += ["--inlier-tol", self.inlier_tol_entry.get()]
+        if self.sharp_top_entry.get():
+            argv += ["--sharp-top", self.sharp_top_entry.get()]
+        if self.band_entry.get():
+            argv += ["--band", self.band_entry.get()]
+        return argv
+
+    def _run(self):
+        if self._running:
+            return
+        if not self.video_var.get() and not self.frames_var.get():
+            messagebox.showwarning("Warning", "Video or frames glob not specified.")
+            return
+
+        argv = self._build_argv()
+        self.log.clear()
+        self.log.append(f"[panorama_recon] argv = {argv}\n\n")
+        self._running = True
+        self.run_btn.configure(state=tk.DISABLED)
+
+        try:
+            from panorama_recon import main as pr_main
+        except SystemExit as e:  # torch not installed
+            self._on_done(str(e.code))
+            return
+        run_with_capture(pr_main, argv, self.log.append, self._on_done, self.app)
 
     def _on_done(self, error: Optional[str]):
         self._running = False
@@ -982,7 +1369,10 @@ class OutputBrowserTab(ttk.Frame):
 # Main Application
 # ============================================================
 
-class App(tk.Tk):
+_AppBase = TkinterDnD.Tk if HAS_DND else tk.Tk
+
+
+class App(_AppBase):  # type: ignore[misc,valid-type]
     def __init__(self):
         super().__init__()
         self.title("Stitch Candidates GUI")
@@ -1011,6 +1401,9 @@ class App(tk.Tk):
 
         self.video_tab = VideoTab(self.notebook, self.log, self.preview, self)
         self.notebook.add(self.video_tab, text="  Video Reconstruct  ")
+
+        self.panorama_tab = PanoramaTab(self.notebook, self.log, self.preview, self)
+        self.notebook.add(self.panorama_tab, text="  Panorama Reconstruct  ")
 
         self.output_tab = OutputBrowserTab(self.notebook, self.preview)
         self.notebook.add(self.output_tab, text="  Output Browser  ")

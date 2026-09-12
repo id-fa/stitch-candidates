@@ -57,7 +57,36 @@ Photoshop / GIMP 等での最終調整を前提としています。
 ```bash
 pip install pillow numpy
 pip install opencv-python   # optional but recommended
+pip install torch           # panorama_recon.py のみ必要 / required only by panorama_recon.py
+pip install tkinterdnd2     # 任意: GUI への動画/フォルダの D&D / optional: drag & drop onto the GUI
 ```
+
+---
+
+## 動画からの背景再構成 v2 / Video background reconstruction v2
+
+`panorama_recon.py` は動画（縦スクロール・横パン）から背景1枚を自動で再構成します。
+候補生成ではなく **1枚の答え** を出す設計です。
+
+- 全フレームの相似変換（平行移動＋ズーム、オプションで回転）をマスク付き NCC と Gauss-Newton で推定し、最小二乗で一括解決（累積誤差なし）
+- 画面に固定されたクレジット文字やロゴを時間差分から自動検出して除外
+- 整列後スタックの時間的中央値で文字・光の粒子を除去
+- GPU（CUDA）があれば自動使用。1080p 135フレームで約25秒
+
+`panorama_recon.py` reconstructs one background image from a scrolling/panning video.
+Per-frame similarity transforms (translation + zoom, optionally rotation) are estimated with masked NCC and
+Gauss-Newton refinement, then solved jointly by least squares,
+screen-fixed overlays (credits, logos) are detected automatically, and a temporal median removes them.
+
+```bash
+python panorama_recon.py --video input.mp4 --out pano_out
+python panorama_recon.py --frames "frames/*.png" --fps 10 --out pano_out
+```
+
+出力 / Outputs: `recon_median.png`（最も頑健）, `recon_mean.png`（低ノイズ）, `recon_sharp.png`（最も鮮明）,
+`coverage.png`, `positions.csv`, `pairs.csv`, `debug_overlay_mask.png`
+
+GUI: `python gui.py` → **Panorama Reconstruct** タブ
 
 ---
 
