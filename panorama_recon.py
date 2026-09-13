@@ -879,12 +879,32 @@ class Reconstructor:
             G = AX[:, 0] > 0.999           # 幾何的に有効
             C = G & (AX[:, 1] > 0.5)       # オーバーレイ除外後
             Sh = AX[:, 2]
+            cnt_c = C.sum(0)               # 被覆数（穴埋め判定用）は解像度フィルタ前の値
+            cnt_g = G.sum(0)
+            if a.anchor_frame is not None and a.anchor_frame >= 0:
+                # アンカーフレーム: 指定フレーム ±window が覆う画素は、それらのフレームだけで合成する
+                # （キャラクターの髪や体が動くカットで、多数決の中央値が動く層の細線を消すのを防ぐ）
+                lo, hi = a.anchor_frame - a.anchor_window, a.anchor_frame + a.anchor_window
+                is_anc = torch.tensor([lo <= k <= hi for k in ks], device=dev)[:, None, None]
+                Ca = C & is_anc
+                has_c = Ca.any(0)
+                C = torch.where(has_c[None], Ca, C)
+                Ga = G & is_anc
+                has_g = Ga.any(0)
+                G = torch.where(has_g[None], Ga, G)
+            if a.res_tol > 0:
+                # 解像度を考慮: 画素ごとに最も拡大率の小さい（細部を持つ）標本を基準に、
+                # 拡大率がその res_tol 倍以内の標本だけを統計に使う（ズーム動画で引きのボケた標本が多数派になるのを防ぐ）
+                Mk = torch.tensor([float(S[k]) for k in ks], device=dev)[:, None, None].expand(len(ks), bh, Wc)
+                big = torch.full_like(Mk, float("inf"))
+                mc = torch.where(C, Mk, big).amin(0)
+                C = C & (Mk <= mc[None] * a.res_tol)
+                mg = torch.where(G, Mk, big).amin(0)
+                G = G & (Mk <= mg[None] * a.res_tol)
             Vc = torch.where(C[:, None], V, nan)
             med_c = torch.nanmedian(Vc, dim=0).values
-            cnt_c = C.sum(0)
             Vg = torch.where(G[:, None], V, nan)
             med_g = torch.nanmedian(Vg, dim=0).values
-            cnt_g = G.sum(0)
             med = torch.where((cnt_c > 0)[None], med_c, med_g)
             med = torch.nan_to_num(med, nan=0.0)
             # インライア: クリーンかつ中央値に近い
@@ -1021,6 +1041,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="キャンバス倍率: auto（最も寄ったフレームが等倍）または数値（frame0 基準、1=frame0 等倍）")
     rd.add_argument("--band", type=int, default=64, help="合成時の行バンド幅（メモリ調整用）")
     rd.add_argument("--inlier-tol", type=float, default=0.06, help="中央値からの許容差（0-1, default: 0.06）")
+    rd.add_argument("--anchor-frame", type=int, default=None,
+                    help="アンカーフレーム番号（抽出後の番号）。このフレーム ±--anchor-window が覆う画素はそれらだけで合成する"
+                         "（動くキャラクターをその姿で確定させる）")
+    rd.add_argument("--anchor-window", type=int, default=2, help="アンカーの前後フレーム数（default: 2）")
+    rd.add_argument("--res-tol", type=float, default=1.25,
+                    help="解像度を考慮した中央値: 画素ごとに最も細部を持つ標本の拡大率 × この値以内の標本だけを使う"
+                         "（ズーム動画で細線が消えるのを防ぐ。default: 1.25, 0=無効）")
     rd.add_argument("--sharp-top", type=float, default=0.3,
                     help="recon_sharp で平均するインライアの鮮明度上位比率（default: 0.3）")
     rd.add_argument("--hole-fill", type=str, default="inpaint", choices=["inpaint", "blur", "none"],

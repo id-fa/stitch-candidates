@@ -45,7 +45,8 @@ function readArgs() {
     holeFill: $("holeFill").value,
     staticMask: $("staticMask").checked, staticSpan: int("staticSpan", 6), staticDiff: num("staticDiff", 0.03),
     staticGrad: num("staticGrad", 0.08), staticDilate: int("staticDilate", 7), staticHalo: int("staticHalo", 12), staticClose: int("staticClose", 3), textHalo: int("textHalo", 4),
-    canvasScale: cs, inlierTol: num("inlierTol", 0.06), sharpTop: num("sharpTop", 0.3),
+    canvasScale: cs, inlierTol: num("inlierTol", 0.06), sharpTop: num("sharpTop", 0.3), resTol: num("resTol", 1.25),
+    anchorFrame: $("anchorFrame").value.trim() === "" ? -1 : int("anchorFrame", -1), anchorWindow: int("anchorWindow", 2),
     stackBudgetMB: int("stackBudget", 128), levelCacheMB: int("levelCache", 768),
   };
 }
@@ -259,6 +260,13 @@ const trim = new TrimPanel($("trim"), {
     $("textRects").value = tx.map((r) => r.join(",")).join("; ");
   },
   onFps: (fps) => { $("fps").value = String(fps); },
+  // アンカー: 動画のフレーム番号 → 抽出後の番号（開始フレーム基準、抽出 fps / 実 fps で換算）
+  onAnchor: (frame, t) => {
+    const ext = num("fps", t.fps) || t.fps;
+    const idx = Math.max(0, Math.round((frame - t.start) * ext / t.fps));
+    $("anchorFrame").value = String(idx);
+    log(`[trim] anchor frame = ${idx} (video frame ${frame})`);
+  },
 });
 window.__trim = trim;   // デバッグ/検証用
 function setFiles(list) {

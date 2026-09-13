@@ -59,6 +59,8 @@ export class TrimPanel {
         <label>Start</label><input type="number" class="t-start" step="1" style="width:80px"><button class="t-sm">-1</button><button class="t-sp">+1</button><span class="hint t-stime"></span>
         <label style="min-width:40px;margin-left:16px">End</label><input type="number" class="t-end" step="1" style="width:80px"><button class="t-em">-1</button><button class="t-ep">+1</button><span class="hint t-etime"></span>
         <span class="hint t-count" style="margin-left:16px"></span>
+        <button class="t-anc-s" style="margin-left:16px" title="開始フレームをアンカーにする（パラメータの anchor frame に設定）">Anchor = start</button>
+        <button class="t-anc-e" title="終了フレームをアンカーにする">Anchor = end</button>
       </div>
       <div class="hint trim-help">
         <b><span class="sw" style="border-color:#ffe040"></span>Crop</b>: 出力に使う範囲（1 個）。ドラッグで描き、角/辺のハンドルで拡縮、内側ドラッグで移動。
@@ -115,6 +117,8 @@ export class TrimPanel {
     q(".t-popt").onclick = () => { this.textRects.pop(); this.sel.text = -1; this.refresh(); };
     q(".t-cleart").onclick = () => { this.textRects = []; this.sel.text = -1; this.refresh(); };
     for (const el of this.cropIn) el.onchange = () => this._cropEntry();
+    q(".t-anc-s").onclick = () => { if (this.opts.onAnchor) this.opts.onAnchor(this.start, this); };
+    q(".t-anc-e").onclick = () => { if (this.opts.onAnchor) this.opts.onAnchor(this.end, this); };
     // 範囲バー
     this.bar.addEventListener("pointerdown", (e) => {
       const f = this._barFrame(e);

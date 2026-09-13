@@ -64,6 +64,10 @@
 <details id="trimBox" open hidden><summary>Trim / Crop</summary><div id="trim"></div></details>
 <div class="grid">
 <div>
+  <div class="row" style="margin:6px 0 8px">
+    <label style="min-width:auto"><input type="checkbox" id="staticMask" checked> 静止オーバーレイ検出</label>
+    <span class="hint">テロップ除去が不要の場合は無効に（ズーム中心付近の動かない細線をテロップと誤判定して消すことがある）。テロップがある場合は有効のまま、細線が消えるなら span を大きく</span>
+  </div>
   <details id="params">
   <summary>パラメータ</summary>
   <fieldset><legend>入力</legend>
@@ -82,13 +86,14 @@
     <div class="row"><label>text rects</label><input type="text" id="textRects" class="wide" placeholder="x,y,w,h; x,y,w,h"><label>text halo</label><input type="number" id="textHalo" value="4" step="1" style="width:60px"><span class="hint">動くテロップ帯（矩形内は勾配で文字をマスクし、text halo px だけ広げる）</span></div>
   </fieldset>
   <fieldset><legend>静止オーバーレイ検出</legend>
-    <div class="row"><label><input type="checkbox" id="staticMask" checked> 有効</label><label>span</label><input type="number" id="staticSpan" value="6" step="1"></div>
+    <div class="row"><span class="hint">有効/無効の切替はパラメータ欄の上の「静止オーバーレイ検出」チェックにあります</span><label>span</label><input type="number" id="staticSpan" value="6" step="1"></div>
     <div class="row"><label>diff</label><input type="number" id="staticDiff" value="0.03" step="0.01"><label>grad</label><input type="number" id="staticGrad" value="0.08" step="0.01"></div>
     <div class="row"><label>dilate</label><input type="number" id="staticDilate" value="7" step="2"><label>halo</label><input type="number" id="staticHalo" value="12" step="1"><label>close</label><input type="number" id="staticClose" value="3" step="1" min="0" max="3"><span class="hint">halo: 静止エッジ周辺の静止画素も除外する半径 px（グロー対策）。close: 前後 N フレームでマスクされていれば埋める（光沢アニメ対策）</span></div>
   </fieldset>
   <fieldset><legend>合成</legend>
     <div class="row"><label>canvas scale</label><input type="text" id="canvasScale" value="auto"><label><input type="checkbox" id="noRender"> 位置推定のみ</label></div>
-    <div class="row"><label>inlier tol</label><input type="number" id="inlierTol" value="0.06" step="0.01"><label>sharp top</label><input type="number" id="sharpTop" value="0.3" step="0.05"></div>
+    <div class="row"><label>inlier tol</label><input type="number" id="inlierTol" value="0.06" step="0.01"><label>sharp top</label><input type="number" id="sharpTop" value="0.3" step="0.05"><label>res tol</label><input type="number" id="resTol" value="1.25" step="0.05"><span class="hint">最も細部を持つ標本の拡大率 × この値以内の標本だけで合成（ズーム動画の細線保護。0 で無効）</span></div>
+    <div class="row"><label>anchor frame</label><input type="number" id="anchorFrame" value="" step="1" placeholder="off"><label>± window</label><input type="number" id="anchorWindow" value="2" step="1" style="width:60px"><span class="hint">抽出後のフレーム番号。そのフレーム±window が覆う範囲はそれらだけで合成（動くキャラクターをその姿で確定）</span></div>
     <div class="row"><label>hole fill</label><select id="holeFill"><option value="inpaint" selected>inpaint</option><option value="blur">blur</option><option value="none">none</option></select><label>min clean</label><input type="number" id="minCleanCnt" value="12" step="1" style="width:60px"> 件 / <input type="number" id="minCleanPct" value="25" step="1" style="width:60px"> %<span class="hint">クリーン標本が無い、または「件数未満かつ被覆の%未満」の画素を周囲から埋める</span></div>
     <div class="row"><label>stack budget MB</label><input type="number" id="stackBudget" value="128" step="32"><label>level cache MB</label><input type="number" id="levelCache" value="768" step="128"></div>
   </fieldset>

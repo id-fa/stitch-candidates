@@ -40,7 +40,11 @@ export async function render(rc, al) {
   // 帯域高さ: サンプルスタック (n × bh × Wc × 8B) が予算に収まるように
   const budget = Math.min(a.stackBudgetMB * 1048576, lim);
   const bh = Math.max(4, Math.min(a.band, Math.floor(budget / (n * Wc * 8))));
-  rc.log(`[render] canvas ${Wc}x${Hc}, canvas scale=${gsc.toFixed(4)}, band=${bh}`);
+  // 拡大率レベル: 1/12 オクターブ刻み（レベル 0 = 拡大率 1/4）。res_lv は許容する差（255 = 無効）
+  const magLevel = (s) => Math.max(0, Math.min(63, Math.round((Math.log2(s) + 2) * 12)));
+  const resLv = a.resTol > 0 ? Math.round(Math.log2(a.resTol) * 12) : 255;
+  const anchor = Number.isFinite(a.anchorFrame) && a.anchorFrame >= 0 ? [Math.max(0, a.anchorFrame - a.anchorWindow), Math.min(n - 1, a.anchorFrame + a.anchorWindow)] : null;
+  rc.log(`[render] canvas ${Wc}x${Hc}, canvas scale=${gsc.toFixed(4)}, band=${bh}, res tol=${a.resTol}` + (anchor ? `, anchor frames ${anchor[0]}-${anchor[1]}` : ""));
   const t0 = now();
   const stack = g.buf(n * bh * Wc * 8, "stack");
   const outMed = g.buf(outBytes, "out_med"), outMean = g.buf(outBytes, "out_mean"), outSharp = g.buf(outBytes, "out_sharp"), outCov = g.buf(outBytes, "out_cov");
@@ -72,10 +76,17 @@ export async function render(rc, al) {
             useBlur = 1;
           }
         }
-        K.warp.run2d({ Wc, y0, bh, W, H, Wq: rc.Wq, Hq: rc.Hq, slot, sharp_off: k * rc.Hq * rc.Wq, use_blur: useBlur, s, c, sn, Tx, Ty },
+        K.warp.run2d({ Wc, y0, bh, W, H, Wq: rc.Wq, Hq: rc.Hq, slot, sharp_off: k * rc.Hq * rc.Wq, use_blur: useBlur, s, c, sn, Tx, Ty, mag_lv: magLevel(s) },
           [rc.frames[k], tmp2, rc.sharpq, stack], Wc, y1 - y0);
       });
-      K.median.run2d({ Wc, bh, K: ks.length, y0, tol: a.inlierTol * 255.0, sharp_top: a.sharpTop }, [stack, outMed, outMean, outSharp, outCov], Wc, y1 - y0);
+      // アンカーフレームのスロット範囲（ks は昇順なので連続）。無ければ lo > hi
+      let ancLo = 1, ancHi = 0;
+      if (anchor) {
+        const idx = ks.map((k, i) => (k >= anchor[0] && k <= anchor[1] ? i : -1)).filter((i) => i >= 0);
+        if (idx.length) { ancLo = idx[0]; ancHi = idx[idx.length - 1]; }
+      }
+      K.median.run2d({ Wc, bh, K: ks.length, y0, tol: a.inlierTol * 255.0, sharp_top: a.sharpTop, res_lv: resLv, anc_lo: ancLo, anc_hi: ancHi },
+        [stack, outMed, outMean, outSharp, outCov], Wc, y1 - y0);
     }
     nb++;
     if (nb % 4 === 0) { await g.done(); rc.progress("render", nb / nbTotal); }

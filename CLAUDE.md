@@ -214,6 +214,13 @@ python panorama_recon.py --video input.mp4 --model translation --out pano_out
     samples that are also under 25% of the covering frames, are filled by push-pull interpolation (or blurred). Filled areas lose
     their real detail (a dense ticker band becomes a smooth strip). The log prints `fallback (no clean sample) px` and the fill count.
   - Do not widen the static test to k±2span "any match": background coincidences inflate the mask (14% → 41% measured).
+- Moving characters / thin lines (added 2026-09-13): in-shot character motion (hair, shoulders; sample3_zoom.mp4 moves ~12 px
+  between frames 2 and 3) makes the majority median wipe thin lines of the moving layer. `--anchor-frame K --anchor-window N`
+  (GUI: Anchor frame / window; Web: anchor frame field, "Anchor = start/end" buttons in the Trim panel) composites pixels covered by
+  frames K±N from those frames only, fixing the pose there (a seam can appear at the anchor coverage boundary). `--res-tol 1.25`
+  (0 = off) restricts each pixel's samples to magnifications within the factor of the most detailed sample (zoom videos); it did
+  not change sample3_zoom (closeup area is only covered by closeup frames) but is kept as a safeguard. Static detection can also
+  mask still thin lines near the zoom centre: disable it or raise `--static-span` when there is no telop.
 - If a static logo sits at a canvas edge covered only by frames where it is masked, the render falls back to the
   unmasked median there (logo remains). `coverage.png` shows such regions as dark.
 

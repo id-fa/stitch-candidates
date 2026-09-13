@@ -1117,6 +1117,15 @@ class PanoramaTab(ttk.Frame):
         self.inlier_tol_entry = LabeledEntry(rf, "Inlier tol:", "0.06", width=6,
                                              tooltip="Max distance from median (0-1) for mean/sharp outputs")
         self.inlier_tol_entry.pack(side=tk.LEFT)
+        self.anchor_entry = LabeledEntry(rf, "Anchor frame:", "", width=6,
+                                         tooltip="Frame index (after extraction) whose pose is kept where it covers the canvas; "
+                                                 "use for moving characters. Empty = off")
+        self.anchor_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.anchor_win_entry = LabeledEntry(rf, "Anchor window:", "2", width=4, tooltip="Frames before/after the anchor to include")
+        self.anchor_win_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.res_tol_entry = LabeledEntry(rf, "Res tol:", "1.25", width=6,
+                                          tooltip="Resolution-aware median: use only samples whose magnification is within this factor of the most detailed one (zoom videos). 0 = off")
+        self.res_tol_entry.pack(side=tk.LEFT, padx=(12, 0))
         self.sharp_top_entry = LabeledEntry(rf, "Sharp top ratio:", "0.3", width=6,
                                             tooltip="Fraction of sharpest inliers averaged in recon_sharp")
         self.sharp_top_entry.pack(side=tk.LEFT, padx=(12, 0))
@@ -1301,6 +1310,12 @@ class PanoramaTab(ttk.Frame):
             argv += ["--inlier-tol", self.inlier_tol_entry.get()]
         if self.sharp_top_entry.get():
             argv += ["--sharp-top", self.sharp_top_entry.get()]
+        if self.res_tol_entry.get():
+            argv += ["--res-tol", self.res_tol_entry.get()]
+        if self.anchor_entry.get():
+            argv += ["--anchor-frame", self.anchor_entry.get()]
+            if self.anchor_win_entry.get():
+                argv += ["--anchor-window", self.anchor_win_entry.get()]
         if self.band_entry.get():
             argv += ["--band", self.band_entry.get()]
         argv += ["--hole-fill", self.hole_fill_var.get()]

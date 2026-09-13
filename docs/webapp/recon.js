@@ -9,7 +9,7 @@ export const DEFAULTS = {
   model: "scale", pairs: [1, 2, 4], coarseScale: 0.25, coarseTol: 2.0, minOverlap: 0.15,
   scaleMax: 0.06, scaleStep: 0.004, fineScale: 1.0, gnIters: 15, ignoreRects: [], textRects: [],
   staticMask: true, staticSpan: 6, staticDiff: 0.03, staticGrad: 0.08, staticDilate: 7, staticHalo: 12, staticClose: 3, textHalo: 4,
-  canvasScale: "auto", band: 64, inlierTol: 0.06, sharpTop: 0.3, stackBudgetMB: 128, levelCacheMB: 768,
+  canvasScale: "auto", band: 64, inlierTol: 0.06, sharpTop: 0.3, resTol: 1.25, anchorFrame: -1, anchorWindow: 2, stackBudgetMB: 128, levelCacheMB: 768,
 };
 
 const odd = (n) => { n = Math.round(n); return n % 2 === 1 ? n : n + 1; };
