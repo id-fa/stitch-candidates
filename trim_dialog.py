@@ -6,8 +6,9 @@ trim_dialog.py - 動画のトリム（開始/終了フレーム）、クロッ�
 
 - 範囲バーの両端ハンドルをドラッグして大まかに指定し、-1 / +1 ボタンで 1 フレーム単位に微調整
 - 開始フレームと終了フレームのプレビューを並べて表示
-- プレビュー上でドラッグして矩形を描く。モード: Crop（1 個、辺/角のハンドルで調整可）、
-  Ignore rect / Text rect（複数、Remove last / Clear で削除）
+- プレビュー上でドラッグして矩形を描く。モード: Crop（1 個）、Ignore rect / Text rect（複数）
+- 描いた矩形の内側を押すと選択して移動、選択中（太線）の矩形は辺/角のハンドルで拡縮。空いた所から描くと新規追加。
+  Ctrl を押しながらドラッグすると既存の矩形の上からでも新規追加。Delete / BackSpace で選択中の矩形を削除
 - 無視矩形とテキスト矩形は内部では元動画座標で持ち、OK 時にクロップ後の座標へ変換して返す
 
 必要: opencv-python, pillow
@@ -76,6 +77,7 @@ class TrimCropDialog(tk.Toplevel):
         ox, oy = (self.crop[0], self.crop[1]) if self.crop else (0, 0)
         self.ignore_rects: List[Rect] = [(x + ox, y + oy, w, h) for (x, y, w, h) in initial.get("ignore_rects", [])]
         self.text_rects: List[Rect] = [(x + ox, y + oy, w, h) for (x, y, w, h) in initial.get("text_rects", [])]
+        self.sel: Dict[str, int] = {"ignore": -1, "text": -1}   # ignore / text の選択中インデックス
 
         self._build()
         self._start_decode()
@@ -83,6 +85,8 @@ class TrimCropDialog(tk.Toplevel):
         self.transient(master)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Delete>", lambda _e: self._delete_selected())
+        self.bind("<BackSpace>", lambda _e: self._delete_selected() if not isinstance(self.focus_get(), (tk.Entry, ttk.Entry)) else None)
 
     # ------------------------------------------------------------ UI
     def _build(self) -> None:
@@ -136,11 +140,12 @@ class TrimCropDialog(tk.Toplevel):
         ttk.Label(rf, textvariable=self.count_var).pack(side=tk.LEFT, padx=12)
 
         # 矩形モード
-        mf = ttk.LabelFrame(top, text="Rectangles (drag on preview)")
+        mf = ttk.LabelFrame(top, text="Rectangles (drag on preview: inside = move, handles = resize, Ctrl+drag = add new, Delete = remove selected)")
         mf.pack(fill=tk.X, pady=4)
         r1 = ttk.Frame(mf)
         r1.pack(fill=tk.X, padx=4, pady=2)
         self.mode_var = tk.StringVar(value="crop")
+        self.mode_var.trace_add("write", lambda *_a: self._refresh_previews())
         for v, t in (("crop", "Crop"), ("ignore", "Ignore rect"), ("text", "Text rect")):
             ttk.Radiobutton(r1, text=t, variable=self.mode_var, value=v).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(r1, text="Aspect:").pack(side=tk.LEFT, padx=(12, 2))
@@ -256,10 +261,13 @@ class TrimCropDialog(tk.Toplevel):
 
     def _draw_rects(self, c: tk.Canvas) -> None:
         s = self.scale
-        for (x, y, w, h) in self.ignore_rects:
-            c.create_rectangle(x * s, y * s, (x + w) * s, (y + h) * s, outline="#ff4040", width=2)
-        for (x, y, w, h) in self.text_rects:
-            c.create_rectangle(x * s, y * s, (x + w) * s, (y + h) * s, outline="#40d0ff", width=2)
+        mode = self.mode_var.get()
+        for k, (x, y, w, h) in enumerate(self.ignore_rects):
+            wd = 3 if (mode == "ignore" and k == self.sel["ignore"]) else 2
+            c.create_rectangle(x * s, y * s, (x + w) * s, (y + h) * s, outline="#ff4040", width=wd)
+        for k, (x, y, w, h) in enumerate(self.text_rects):
+            wd = 3 if (mode == "text" and k == self.sel["text"]) else 2
+            c.create_rectangle(x * s, y * s, (x + w) * s, (y + h) * s, outline="#40d0ff", width=wd)
         if self.crop:
             x, y, w, h = self.crop
             # クロップ外を暗くする
@@ -268,17 +276,52 @@ class TrimCropDialog(tk.Toplevel):
                 if cx > a and d > b:
                     c.create_rectangle(a, b, cx, d, fill="#000000", stipple="gray50", outline="")
             c.create_rectangle(x * s, y * s, (x + w) * s, (y + h) * s, outline="#ffe040", width=2)
-            for hx, hy in self._crop_handles():
-                c.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4, fill="#ffe040", outline="")
+        selr = self._sel_rect()
+        if selr:
+            col = {"crop": "#ffe040", "ignore": "#ff4040", "text": "#40d0ff"}[mode]
+            for hx, hy in self._handles(selr):
+                c.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4, fill=col, outline="")
         if self._drag and self._drag.get("preview"):
             x, y, w, h = self._drag["preview"]
             col = {"crop": "#ffe040", "ignore": "#ff4040", "text": "#40d0ff"}[self._drag["mode"]]
             c.create_rectangle(x * s, y * s, (x + w) * s, (y + h) * s, outline=col, width=2, dash=(4, 2))
 
-    def _crop_handles(self) -> List[Tuple[float, float]]:
-        if not self.crop:
+    # ---- 選択中の矩形 ----
+    def _list(self, kind: str) -> List[Rect]:
+        return self.ignore_rects if kind == "ignore" else self.text_rects
+
+    def _sel_rect(self) -> Optional[Rect]:
+        """現在のモードで選択中の矩形（crop モードならクロップ）"""
+        mode = self.mode_var.get()
+        if mode == "crop":
+            return self.crop
+        lst, i = self._list(mode), self.sel[mode]
+        return lst[i] if 0 <= i < len(lst) else None
+
+    def _set_sel_rect(self, r: Rect) -> None:
+        mode = self.mode_var.get()
+        if mode == "crop":
+            self.crop = r
+        else:
+            lst, i = self._list(mode), self.sel[mode]
+            if 0 <= i < len(lst):
+                lst[i] = r
+
+    def _delete_selected(self) -> None:
+        mode = self.mode_var.get()
+        if mode == "crop":
+            self.crop = None
+        else:
+            lst, i = self._list(mode), self.sel[mode]
+            if 0 <= i < len(lst):
+                del lst[i]
+            self.sel[mode] = -1
+        self._refresh_all()
+
+    def _handles(self, r: Optional[Rect]) -> List[Tuple[float, float]]:
+        if not r:
             return []
-        x, y, w, h = self.crop
+        x, y, w, h = r
         s = self.scale
         xs = (x * s, (x + w / 2) * s, (x + w) * s)
         ys = (y * s, (y + h / 2) * s, (y + h) * s)
@@ -345,37 +388,54 @@ class TrimCropDialog(tk.Toplevel):
         return max(0.0, min(self.W, e.x / self.scale)), max(0.0, min(self.H, e.y / self.scale))
 
     def _hit_crop_handle(self, e) -> Optional[int]:
-        for i, (hx, hy) in enumerate(self._crop_handles()):
+        for i, (hx, hy) in enumerate(self._handles(self._sel_rect())):
             if abs(e.x - hx) <= 6 and abs(e.y - hy) <= 6:
                 return i
         return None
 
+    @staticmethod
+    def _inside(r: Optional[Rect], fx: float, fy: float) -> bool:
+        return bool(r) and r[0] <= fx <= r[0] + r[2] and r[1] <= fy <= r[1] + r[3]
+
     def _on_move(self, e, which: str) -> None:
         c = self._canvases[which]
-        inside = False
-        if self.crop:
-            fx, fy = self._to_frame(e)
-            x, y, w, h = self.crop
-            inside = x <= fx <= x + w and y <= fy <= y + h
-        if self.mode_var.get() == "crop" and (self._hit_crop_handle(e) is not None or inside):
-            c.configure(cursor="fleur")
-        else:
-            c.configure(cursor="crosshair")
+        fx, fy = self._to_frame(e)
+        mode = self.mode_var.get()
+        over = self._hit_crop_handle(e) is not None or self._inside(self._sel_rect(), fx, fy)
+        if not over and mode != "crop":
+            over = any(self._inside(r, fx, fy) for r in self._list(mode))
+        ctrl = bool(e.state & 0x4)
+        c.configure(cursor="fleur" if (over and not ctrl) else "crosshair")
 
     def _on_press(self, e, which: str) -> None:
         mode = self.mode_var.get()
         fx, fy = self._to_frame(e)
-        if mode == "crop" and self.crop:
-            hi = self._hit_crop_handle(e)
-            x, y, w, h = self.crop
-            if hi is not None:
-                # ハンドル: 0..7 = 左上, 上, 右上, 左, 右, 左下, 下, 右下
-                self._drag = {"mode": "crop", "handle": hi, "orig": (x, y, x + w, y + h), "preview": None}
-                return
-            if x <= fx <= x + w and y <= fy <= y + h:
-                # 内側をドラッグ: 移動
-                self._drag = {"mode": "crop", "move": (fx, fy), "orig": (x, y, x + w, y + h), "preview": None}
-                return
+        self.focus_set()   # Delete キーを受けるため
+        force_new = bool(e.state & 0x4)   # Ctrl
+        if not force_new:
+            # 1) 選択中の矩形のハンドル → 拡縮、内側 → 移動
+            cur = self._sel_rect()
+            if cur:
+                hi = self._hit_crop_handle(e)
+                x, y, w, h = cur
+                if hi is not None:
+                    # ハンドル: 0..7 = 左上, 上, 右上, 左, 右, 左下, 下, 右下
+                    self._drag = {"mode": mode, "edit": True, "handle": hi, "orig": (x, y, x + w, y + h), "preview": None}
+                    return
+                if self._inside(cur, fx, fy):
+                    self._drag = {"mode": mode, "edit": True, "move": (fx, fy), "orig": (x, y, x + w, y + h), "preview": None}
+                    return
+            # 2) 同じ種類の他の矩形の内側 → それを選択して移動（後から描いたものを優先）
+            if mode != "crop":
+                lst = self._list(mode)
+                for k in range(len(lst) - 1, -1, -1):
+                    if self._inside(lst[k], fx, fy):
+                        self.sel[mode] = k
+                        x, y, w, h = lst[k]
+                        self._drag = {"mode": mode, "edit": True, "move": (fx, fy), "orig": (x, y, x + w, y + h), "preview": None}
+                        self._refresh_previews()
+                        return
+        # 3) 新規
         self._drag = {"mode": mode, "x0": fx, "y0": fy, "preview": None}
 
     def _apply_aspect(self, x0: float, y0: float, x1: float, y1: float) -> Tuple[float, float, float, float]:
@@ -392,13 +452,13 @@ class TrimCropDialog(tk.Toplevel):
             return
         fx, fy = self._to_frame(e)
         d = self._drag
-        if d["mode"] == "crop" and "move" in d:
+        if "move" in d:
             x0, y0, x1, y1 = d["orig"]
             dx, dy = fx - d["move"][0], fy - d["move"][1]
             dx = max(-x0, min(self.W - x1, dx))
             dy = max(-y0, min(self.H - y1, dy))
             d["preview"] = _norm_rect(x0 + dx, y0 + dy, x1 + dx, y1 + dy)
-        elif d["mode"] == "crop" and "handle" in d:
+        elif "handle" in d:
             x0, y0, x1, y1 = d["orig"]
             hi = d["handle"]
             if hi in (0, 3, 5):
@@ -409,7 +469,7 @@ class TrimCropDialog(tk.Toplevel):
                 y0 = fy
             if hi in (5, 6, 7):
                 y1 = fy
-            ar = ASPECTS.get(self.aspect_var.get())
+            ar = ASPECTS.get(self.aspect_var.get()) if d["mode"] == "crop" else None
             if ar is not None:
                 y1 = y0 + abs(x1 - x0) / ar
             d["preview"] = _norm_rect(x0, y0, x1, y1)
@@ -433,12 +493,14 @@ class TrimCropDialog(tk.Toplevel):
         x, y = max(0, x), max(0, y)
         w, h = min(self.W - x, w), min(self.H - y, h)
         r = (x, y, w, h)
-        if d["mode"] == "crop":
+        if d.get("edit"):
+            self._set_sel_rect(r)
+        elif d["mode"] == "crop":
             self.crop = r
-        elif d["mode"] == "ignore":
-            self.ignore_rects.append(r)
         else:
-            self.text_rects.append(r)
+            lst = self._list(d["mode"])
+            lst.append(r)
+            self.sel[d["mode"]] = len(lst) - 1
         self._refresh_all()
 
     def _crop_entry_apply(self) -> None:
@@ -457,13 +519,15 @@ class TrimCropDialog(tk.Toplevel):
         self._refresh_all()
 
     def _pop(self, kind: str) -> None:
-        lst = self.ignore_rects if kind == "ignore" else self.text_rects
+        lst = self._list(kind)
         if lst:
             lst.pop()
+        self.sel[kind] = -1
         self._refresh_all()
 
     def _clear(self, kind: str) -> None:
-        (self.ignore_rects if kind == "ignore" else self.text_rects).clear()
+        self._list(kind).clear()
+        self.sel[kind] = -1
         self._refresh_all()
 
     # ------------------------------------------------------------ 終了

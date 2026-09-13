@@ -198,7 +198,9 @@ python panorama_recon.py --video input.mp4 --model translation --out pano_out
 - Frame range / crop (added 2026-09-13): `--start-frame N --end-frame M` (0-based, inclusive; override `--start`/`--duration`)
   and `--crop x,y,w,h` (source coordinates, applied at load; `--ignore-rect`/`--text-rect` are then in cropped coordinates).
   The GUI's Panorama tab has a "Trim / Crop..." button opening `trim_dialog.py`: start/end previews, a range bar with two
-  handles, -1/+1 buttons, and drag-to-draw rectangles (crop with handles / ignore / text) whose results fill the tab's fields.
+  handles, -1/+1 buttons, and drag-to-draw rectangles (crop / ignore / text) whose results fill the tab's fields. Rectangles are
+  editable afterwards in both the dialog and the Web panel: press inside to select + move, handles resize the selected one,
+  Ctrl+drag forces a new rectangle, Delete removes the selection.
   Thumbnails are decoded in a background thread (OpenCV), capped at 1500 (strided beyond that; other frames are seeked on demand).
 - Telop / ticker residue (added 2026-09-13, same as the Web version):
   - `--text-rect x,y,w,h` (repeatable): bands with *moving* text (tickers). Inside, high-gradient pixels are masked per frame
