@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Panorama Reconstruct (WebGPU)</title>
+<title>Panorama Reconstruct (WebGPU) - id-fa/stitch_candidates</title>
 <style>
   :root { color-scheme: light dark; --bg: #f5f5f7; --fg: #1d1d1f; --panel: #fff; --line: #d0d0d5; --acc: #2d6cdf; }
   @media (prefers-color-scheme: dark) { :root { --bg: #17171a; --fg: #e8e8ec; --panel: #222226; --line: #3a3a40; --acc: #6ea0ff; } }
@@ -38,7 +38,9 @@
   .trim-help .sw { display: inline-block; width: 10px; height: 10px; border: 2px solid; margin: 0 4px -1px 0; }
   .trim-wrap { position: relative; display: block; line-height: 0; }
   .trim-wrap video { width: 100%; display: block; background: #202020; }
-  .trim-wrap canvas { position: absolute; left: 0; top: 0; cursor: crosshair; touch-action: none; }
+  .trim-wrap canvas.trim-ov { position: absolute; left: 0; top: 0; cursor: crosshair; touch-action: none; }
+  .trim-wrap canvas.trim-loupe { position: absolute; width: 180px; height: 180px; pointer-events: none; border: 2px solid #fff;
+    border-radius: 4px; box-shadow: 0 0 0 1px #000, 0 2px 8px rgba(0,0,0,.5); background: #000; }
   .trim-bar { position: relative; height: 30px; margin: 8px 0 4px; background: #d8d8dc; border-radius: 4px; cursor: ew-resize; touch-action: none; user-select: none; }
   .trim-range { position: absolute; top: 11px; height: 8px; background: var(--acc); opacity: .7; }
   .trim-handle { position: absolute; top: 0; width: 12px; height: 30px; margin-left: -6px; background: var(--acc); border-radius: 3px; box-shadow: 0 0 0 1px #fff inset; }

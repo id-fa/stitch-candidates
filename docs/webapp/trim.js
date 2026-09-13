@@ -5,9 +5,12 @@
 // - プレビュー上のドラッグで矩形を描く。モード: crop（1 個、ハンドルで拡縮・内側ドラッグで移動）、ignore / text（複数）
 // - フレームレートは requestVideoFrameCallback で実測（取れなければ fallback 値）。フレーム番号は t*fps の近似
 // - 無視/テキスト矩形は内部では元動画座標で持ち、getState() でクロップ後の座標に変換して返す
+// - ルーペ: プレビュー上のカーソル位置を LOUPE_ZOOM 倍で拡大表示（矩形の辺と座標も描く）。ホイールで倍率変更
 
 const ASPECTS = { free: null, "16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1, "9:16": 9 / 16, "21:9": 21 / 9 };
 const COMMON_FPS = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 120];
+const LOUPE_PX = 180;                 // ルーペの表示サイズ（CSS px）
+const LOUPE_ZOOMS = [2, 4, 8];        // ホイールで切替
 
 function normRect(x0, y0, x1, y1) {
   const xa = Math.min(x0, x1), xb = Math.max(x0, x1), ya = Math.min(y0, y1), yb = Math.max(y0, y1);
@@ -43,8 +46,8 @@ export class TrimPanel {
     const r = this.root;
     r.innerHTML = `
       <div class="trim-previews">
-        <div class="trim-col"><div class="hint">Start frame</div><div class="trim-wrap"><video muted playsinline preload="auto"></video><canvas class="trim-ov"></canvas></div></div>
-        <div class="trim-col"><div class="hint">End frame</div><div class="trim-wrap"><video muted playsinline preload="auto"></video><canvas class="trim-ov"></canvas></div></div>
+        <div class="trim-col"><div class="hint">Start frame</div><div class="trim-wrap"><video muted playsinline preload="auto"></video><canvas class="trim-ov"></canvas><canvas class="trim-loupe" hidden></canvas></div></div>
+        <div class="trim-col"><div class="hint">End frame</div><div class="trim-wrap"><video muted playsinline preload="auto"></video><canvas class="trim-ov"></canvas><canvas class="trim-loupe" hidden></canvas></div></div>
       </div>
       <div class="hint trim-info"></div>
       <div class="trim-bar"><div class="trim-range"></div><div class="trim-handle" data-h="start"></div><div class="trim-handle" data-h="end"></div></div>
@@ -77,6 +80,9 @@ export class TrimPanel {
     const q = (sel) => r.querySelector(sel);
     this.videos = [...r.querySelectorAll("video")];
     this.overlays = [...r.querySelectorAll("canvas.trim-ov")];
+    this.loupes = [...r.querySelectorAll("canvas.trim-loupe")];
+    this.loupeZoom = 4;
+    for (const lp of this.loupes) { lp.width = LOUPE_PX * 2; lp.height = LOUPE_PX * 2; }   // 高 DPI 向けに 2 倍解像度
     this.bar = q(".trim-bar"); this.range = q(".trim-range");
     this.handles = { start: q('.trim-handle[data-h="start"]'), end: q('.trim-handle[data-h="end"]') };
     this.inStart = q(".t-start"); this.inEnd = q(".t-end");
@@ -106,10 +112,17 @@ export class TrimPanel {
     this.bar.addEventListener("pointermove", (e) => { if (this.barActive) this.set(this.barActive, this._barFrame(e)); });
     this.bar.addEventListener("pointerup", () => { this.barActive = null; });
     // プレビュー上の矩形操作
-    this.overlays.forEach((cv) => {
+    this.overlays.forEach((cv, i) => {
       cv.addEventListener("pointerdown", (e) => this._onPress(e, cv));
-      cv.addEventListener("pointermove", (e) => this._onMove(e, cv));
+      cv.addEventListener("pointermove", (e) => { this._onMove(e, cv); this._loupe(e, i); });
       cv.addEventListener("pointerup", (e) => this._onRelease(e, cv));
+      cv.addEventListener("pointerleave", () => { this.loupes[i].hidden = true; });
+      cv.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const k = LOUPE_ZOOMS.indexOf(this.loupeZoom);
+        this.loupeZoom = LOUPE_ZOOMS[Math.max(0, Math.min(LOUPE_ZOOMS.length - 1, k + (e.deltaY < 0 ? 1 : -1)))];
+        this._loupe(e, i);
+      }, { passive: false });
     });
     window.addEventListener("resize", () => this._layout());
   }
@@ -288,6 +301,44 @@ export class TrimPanel {
       d.preview = normRect(d.x0, d.y0, x1, y1);
     }
     this._drawOverlays();
+  }
+  /** カーソル位置を拡大表示するルーペ。i = プレビュー番号 */
+  _loupe(e, i) {
+    const lp = this.loupes[i], cv = this.overlays[i], v = this.videos[i];
+    if (!this.W || v.readyState < 2) { lp.hidden = true; return; }
+    const [fx, fy] = this._toFrame(e, cv);
+    const z = this.loupeZoom, S = LOUPE_PX / z;        // 元動画座標での表示範囲（px）
+    const sx = fx - S / 2, sy = fy - S / 2;
+    const g = lp.getContext("2d"), L = lp.width, k = L / S;   // 元動画 px → ルーペ px
+    g.imageSmoothingEnabled = false;
+    g.fillStyle = "#000"; g.fillRect(0, 0, L, L);
+    // 範囲外は黒のまま（drawImage の source は動画内にクリップする）
+    const cx0 = Math.max(0, sx), cy0 = Math.max(0, sy), cx1 = Math.min(this.W, sx + S), cy1 = Math.min(this.H, sy + S);
+    if (cx1 > cx0 && cy1 > cy0) {
+      try { g.drawImage(v, cx0, cy0, cx1 - cx0, cy1 - cy0, (cx0 - sx) * k, (cy0 - sy) * k, (cx1 - cx0) * k, (cy1 - cy0) * k); } catch (err) { /* ignore */ }
+    }
+    // 矩形の辺
+    g.lineWidth = 2;
+    const rect = (r, col, dash) => { g.strokeStyle = col; g.setLineDash(dash || []); g.strokeRect((r[0] - sx) * k, (r[1] - sy) * k, r[2] * k, r[3] * k); };
+    for (const r of this.ignoreRects) rect(r, "#ff4040");
+    for (const r of this.textRects) rect(r, "#40d0ff");
+    if (this.crop) rect(this.crop, "#ffe040");
+    if (this.drag && this.drag.preview) rect(this.drag.preview, { crop: "#ffe040", ignore: "#ff4040", text: "#40d0ff" }[this.drag.mode], [6, 3]);
+    // 十字線と座標
+    g.setLineDash([]); g.strokeStyle = "rgba(255,255,255,0.9)"; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(L / 2, 0); g.lineTo(L / 2, L); g.moveTo(0, L / 2); g.lineTo(L, L / 2); g.stroke();
+    g.strokeStyle = "rgba(0,0,0,0.6)"; g.strokeRect(L / 2 - k / 2, L / 2 - k / 2, k, k);
+    const txt = `${Math.floor(fx)}, ${Math.floor(fy)}  x${z}`;
+    g.font = "bold 22px system-ui, sans-serif"; g.textBaseline = "top";
+    g.fillStyle = "rgba(0,0,0,0.6)"; g.fillRect(4, 4, g.measureText(txt).width + 12, 30);
+    g.fillStyle = "#fff"; g.fillText(txt, 10, 8);
+    // カーソルの右下に表示。端に近ければ左/上へ反転
+    const rc = cv.getBoundingClientRect();
+    let px = e.clientX - rc.left + 24, py = e.clientY - rc.top + 24;
+    if (px + LOUPE_PX > cv.width) px = e.clientX - rc.left - 24 - LOUPE_PX;
+    if (py + LOUPE_PX > cv.height) py = e.clientY - rc.top - 24 - LOUPE_PX;
+    lp.style.left = `${Math.max(0, px)}px`; lp.style.top = `${Math.max(0, py)}px`;
+    lp.hidden = false;
   }
   _onRelease() {
     if (!this.drag) return;
