@@ -977,6 +977,16 @@ class PanoramaTab(ttk.Frame):
         ttk.Button(vf, text="Browse...", command=self._browse_video).pack(side=tk.LEFT)
         for w in (f, vf, video_entry):
             enable_drop(w, self._on_drop_input)
+        # トリム/クロップ: 動画行の直下に目立つボタンを置く（右端に置くと幅の広い行に押し出されて見えなくなる）
+        tr = ttk.Frame(f)
+        tr.pack(fill=tk.X, padx=4, pady=(0, 4))
+        self.trim_button = tk.Button(
+            tr, text="✂  Trim / Crop...", command=self._open_trim_dialog,
+            bg="#1565c0", fg="white", activebackground="#0d47a1", activeforeground="white",
+            font=("Segoe UI", 10, "bold"), padx=14, pady=4, relief=tk.RAISED, bd=2, cursor="hand2")
+        self.trim_button.pack(side=tk.LEFT)
+        ttk.Label(tr, text="Pick start / end frames and draw crop, ignore and text rectangles on a preview",
+                  foreground="#666666").pack(side=tk.LEFT, padx=10)
 
         ff = ttk.Frame(f)
         ff.pack(fill=tk.X, padx=4, pady=2)
@@ -1003,6 +1013,17 @@ class PanoramaTab(ttk.Frame):
         self.dur_entry.pack(side=tk.LEFT, padx=(12, 0))
         self.max_frames_entry = LabeledEntry(ef, "Max frames:", "", width=6)
         self.max_frames_entry.pack(side=tk.LEFT, padx=(12, 0))
+        tf = ttk.Frame(f)
+        tf.pack(fill=tk.X, padx=4, pady=2)
+        self.start_frame_entry = LabeledEntry(tf, "Start frame:", "", width=7,
+                                              tooltip="First frame index (0-based); overrides Start (s)")
+        self.start_frame_entry.pack(side=tk.LEFT)
+        self.end_frame_entry = LabeledEntry(tf, "End frame:", "", width=7,
+                                            tooltip="Last frame index (inclusive); overrides Duration (s)")
+        self.end_frame_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.crop_entry = LabeledEntry(tf, "Crop (x,y,w,h):", "", width=18,
+                                       tooltip="Crop rectangle in source video coordinates; ignore/text rects are in cropped coordinates")
+        self.crop_entry.pack(side=tk.LEFT, padx=(12, 0))
 
         # --- Output ---
         f = ttk.LabelFrame(pf, text="Output")
@@ -1056,6 +1077,14 @@ class PanoramaTab(ttk.Frame):
         self.ignore_rect_entry = LabeledEntry(f, "Ignore rects (x,y,w,h; ...):", "",
                                               tooltip="Always-excluded rectangles, semicolon separated")
         self.ignore_rect_entry.pack(fill=tk.X, padx=4)
+        tf = ttk.Frame(f)
+        tf.pack(fill=tk.X, padx=4)
+        self.text_rect_entry = LabeledEntry(tf, "Text rects (x,y,w,h; ...):", "",
+                                            tooltip="Moving ticker/telop bands: high-gradient pixels inside are masked per frame")
+        self.text_rect_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.text_halo_entry = LabeledEntry(tf, "Text halo:", "4", width=5,
+                                            tooltip="Grow the text mask inside text rects by this many px")
+        self.text_halo_entry.pack(side=tk.LEFT, padx=(12, 0))
 
         # --- Static overlay ---
         f = ttk.LabelFrame(pf, text="Static Overlay Detection (credits / logos)")
@@ -1073,6 +1102,12 @@ class PanoramaTab(ttk.Frame):
         self.static_grad_entry.pack(side=tk.LEFT, padx=(12, 0))
         self.static_dilate_entry = LabeledEntry(sf, "Dilate:", "7", width=5)
         self.static_dilate_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.static_halo_entry = LabeledEntry(sf, "Halo:", "12", width=5,
+                                              tooltip="Also mask static pixels within N px of static edges (text glow). 0 = off")
+        self.static_halo_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.static_close_entry = LabeledEntry(sf, "Close:", "3", width=5,
+                                               tooltip="Mask pixels masked in both k-j and k+j frames, j=1..N (0-3)")
+        self.static_close_entry.pack(side=tk.LEFT, padx=(12, 0))
 
         # --- Render ---
         f = ttk.LabelFrame(pf, text="Render")
@@ -1090,6 +1125,71 @@ class PanoramaTab(ttk.Frame):
         self.canvas_scale_entry = LabeledEntry(rf, "Canvas scale:", "auto", width=6,
                                                tooltip="auto = most zoomed-in frame at 1:1; or a number relative to frame 0")
         self.canvas_scale_entry.pack(side=tk.LEFT, padx=(12, 0))
+        hf = ttk.Frame(f)
+        hf.pack(fill=tk.X, padx=4)
+        ttk.Label(hf, text="Hole fill:").pack(side=tk.LEFT)
+        self.hole_fill_var = tk.StringVar(value="inpaint")
+        ttk.Combobox(hf, textvariable=self.hole_fill_var, values=["inpaint", "blur", "none"],
+                     state="readonly", width=8).pack(side=tk.LEFT, padx=(4, 0))
+        self.min_clean_entry = LabeledEntry(hf, "Min clean:", "12", width=5,
+                                            tooltip="Fill pixels whose clean-sample count is below this AND below Min clean %")
+        self.min_clean_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.min_clean_pct_entry = LabeledEntry(hf, "Min clean %:", "25", width=5)
+        self.min_clean_pct_entry.pack(side=tk.LEFT, padx=(12, 0))
+
+    def _open_trim_dialog(self):
+        """Trim / Crop ダイアログ（trim_dialog.py）。結果を Start/End frame, Crop, Ignore/Text rects に反映。"""
+        video = self.video_var.get().strip()
+        if not video or not os.path.isfile(video):
+            messagebox.showwarning("Trim / Crop", "Select a video file first.")
+            return
+        try:
+            from trim_dialog import ask_trim_crop
+        except ImportError as e:
+            messagebox.showerror("Trim / Crop", f"trim_dialog.py / opencv-python / pillow が必要です: {e}")
+            return
+
+        def parse_rects(text: str):
+            out = []
+            for r in text.split(";"):
+                r = r.strip()
+                if r:
+                    try:
+                        out.append(tuple(int(v) for v in r.split(",")))
+                    except ValueError:
+                        pass
+            return [r for r in out if len(r) == 4]
+
+        def parse_int(text: str):
+            try:
+                return int(text) if text.strip() else None
+            except ValueError:
+                return None
+
+        crop = parse_rects(self.crop_entry.get())
+        initial = {
+            "start_frame": parse_int(self.start_frame_entry.get()),
+            "end_frame": parse_int(self.end_frame_entry.get()),
+            "crop": crop[0] if crop else None,
+            "ignore_rects": parse_rects(self.ignore_rect_entry.get()),
+            "text_rects": parse_rects(self.text_rect_entry.get()),
+        }
+        try:
+            res = ask_trim_crop(self.winfo_toplevel(), video, initial)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Trim / Crop", str(e))
+            return
+        if not res:
+            return
+        self.start_frame_entry.var.set(str(res["start_frame"]))
+        self.end_frame_entry.var.set(str(res["end_frame"]))
+        self.crop_entry.var.set(",".join(str(v) for v in res["crop"]) if res["crop"] else "")
+        self.ignore_rect_entry.var.set("; ".join(",".join(str(v) for v in r) for r in res["ignore_rects"]))
+        self.text_rect_entry.var.set("; ".join(",".join(str(v) for v in r) for r in res["text_rects"]))
+        if self.log:
+            self.log.append(f"[trim] frames {res['start_frame']}-{res['end_frame']} "
+                            f"({res['end_frame'] - res['start_frame'] + 1} of {res['n_frames']}), "
+                            f"crop={res['crop']}, ignore={len(res['ignore_rects'])}, text={len(res['text_rects'])}" + chr(10))
 
     def _browse_video(self):
         f = filedialog.askopenfilename(
@@ -1165,10 +1265,22 @@ class PanoramaTab(ttk.Frame):
             argv += ["--coarse-scale", self.coarse_scale_entry.get()]
         if self.min_overlap_entry.get():
             argv += ["--min-overlap", self.min_overlap_entry.get()]
+        if self.start_frame_entry.get():
+            argv += ["--start-frame", self.start_frame_entry.get()]
+        if self.end_frame_entry.get():
+            argv += ["--end-frame", self.end_frame_entry.get()]
+        if self.crop_entry.get():
+            argv += ["--crop", self.crop_entry.get().replace(" ", "")]
         for rect in self.ignore_rect_entry.get().split(";"):
             rect = rect.strip()
             if rect:
                 argv += ["--ignore-rect", rect]
+        for rect in self.text_rect_entry.get().split(";"):
+            rect = rect.strip()
+            if rect:
+                argv += ["--text-rect", rect]
+        if self.text_halo_entry.get():
+            argv += ["--text-halo", self.text_halo_entry.get()]
 
         if not self.static_mask_var.get():
             argv += ["--no-static-mask"]
@@ -1180,6 +1292,10 @@ class PanoramaTab(ttk.Frame):
             argv += ["--static-grad", self.static_grad_entry.get()]
         if self.static_dilate_entry.get():
             argv += ["--static-dilate", self.static_dilate_entry.get()]
+        if self.static_halo_entry.get():
+            argv += ["--static-halo", self.static_halo_entry.get()]
+        if self.static_close_entry.get():
+            argv += ["--static-close", self.static_close_entry.get()]
 
         if self.inlier_tol_entry.get():
             argv += ["--inlier-tol", self.inlier_tol_entry.get()]
@@ -1187,6 +1303,11 @@ class PanoramaTab(ttk.Frame):
             argv += ["--sharp-top", self.sharp_top_entry.get()]
         if self.band_entry.get():
             argv += ["--band", self.band_entry.get()]
+        argv += ["--hole-fill", self.hole_fill_var.get()]
+        if self.min_clean_entry.get():
+            argv += ["--min-clean", self.min_clean_entry.get()]
+        if self.min_clean_pct_entry.get():
+            argv += ["--min-clean-pct", self.min_clean_pct_entry.get()]
         return argv
 
     def _run(self):

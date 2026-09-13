@@ -1,0 +1,92 @@
+# Sample workflow for building and deploying a Jekyll site to GitHub Pages
+name: Deploy Jekyll with GitHub Pages dependencies preinstalled
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Inject GA if configured
+        env:
+          GA: ${{ secrets.GA_MEASUREMENT_ID }}
+        run: |
+          python - <<'PY'
+          import os, glob
+          GA = os.environ.get('GA') or ''
+          if not GA:
+              print('GA not set; skipping injection')
+          else:
+              patterns = ['docs/*.html', 'docs/**/*.html']
+              files = []
+              for p in patterns:
+                  files += glob.glob(p, recursive=True)
+              files = sorted(set(files))
+              modified = []
+              insert = (
+                  f'<script async src="https://www.googletagmanager.com/gtag/js?id={GA}"></script>\n'
+                  "<script>\n"
+                  "  window.dataLayer = window.dataLayer || [];\n"
+                  "  function gtag(){dataLayer.push(arguments);}\n"
+                  "  gtag('js', new Date());\n"
+                  f"  gtag('config', '{GA}');\n"
+                  "</script>\n"
+              )
+              for p in files:
+                  try:
+                      with open(p, 'r', encoding='utf-8') as f:
+                          s = f.read()
+                  except Exception as e:
+                      print('skip (read error):', p, e)
+                      continue
+                  # Skip if already contains GA/gtag/gtm
+                  if 'googletagmanager.com' in s or 'gtag(' in s or 'gtm.js' in s:
+                      continue
+                  if '</head>' in s:
+                      # Replace only the first occurrence: comic-viewer.html has a
+                      # second '</head>' inside the EPUB reader's srcdoc template literal.
+                      s2 = s.replace('</head>', insert + '</head>', 1)
+                      if s2 != s:
+                          with open(p, 'w', encoding='utf-8') as f:
+                              f.write(s2)
+                          modified.append(p)
+              print('Modified files:', modified)
+          PY
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

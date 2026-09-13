@@ -73,12 +73,30 @@ def expand_globs(args: List[str]) -> List[Path]:
     return out
 
 
-def load_frames_from_paths(paths: List[Path], every: int, max_frames: int) -> List[np.ndarray]:
+def apply_crop(img: np.ndarray, crop: Optional[Tuple[int, int, int, int]]) -> np.ndarray:
+    """crop = (x, y, w, h)。None ならそのまま。範囲は画像内にクリップ。"""
+    if crop is None:
+        return img
+    x, y, w, h = crop
+    H, W = img.shape[:2]
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(W, x + w), min(H, y + h)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        sys.exit(f"--crop {crop} が画像 {W}x{H} の外か小さすぎます")
+    return np.ascontiguousarray(img[y0:y1, x0:x1])
+
+
+def load_frames_from_paths(paths: List[Path], every: int, max_frames: int,
+                           start_frame: Optional[int] = None, end_frame: Optional[int] = None,
+                           crop: Optional[Tuple[int, int, int, int]] = None) -> List[np.ndarray]:
     frames: List[np.ndarray] = []
+    s0 = start_frame or 0
     for k, p in enumerate(paths):
-        if k % every != 0:
+        if k < s0 or (end_frame is not None and k > end_frame):
             continue
-        frames.append(np.array(Image.open(p).convert("RGB")))
+        if (k - s0) % every != 0:
+            continue
+        frames.append(apply_crop(np.array(Image.open(p).convert("RGB")), crop))
         if max_frames and len(frames) >= max_frames:
             break
     return frames
@@ -86,7 +104,10 @@ def load_frames_from_paths(paths: List[Path], every: int, max_frames: int) -> Li
 
 def load_frames_from_video(path: Path, every: int, fps: Optional[float],
                            start: float, duration: Optional[float],
-                           max_frames: int) -> Tuple[List[np.ndarray], float]:
+                           max_frames: int,
+                           start_frame: Optional[int] = None, end_frame: Optional[int] = None,
+                           crop: Optional[Tuple[int, int, int, int]] = None) -> Tuple[List[np.ndarray], float]:
+    """start_frame / end_frame（両端含む）が指定されていれば秒指定より優先。crop は (x, y, w, h)。"""
     try:
         import cv2  # type: ignore
     except ImportError:
@@ -100,6 +121,10 @@ def load_frames_from_video(path: Path, every: int, fps: Optional[float],
         step = max(1, int(round(src_fps / fps)))
     start_f = int(round(start * src_fps))
     end_f = None if duration is None else start_f + int(round(duration * src_fps))
+    if start_frame is not None:
+        start_f = max(0, int(start_frame))
+    if end_frame is not None:
+        end_f = int(end_frame) + 1
     if start_f > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
     frames: List[np.ndarray] = []
@@ -111,7 +136,7 @@ def load_frames_from_video(path: Path, every: int, fps: Optional[float],
         if end_f is not None and idx >= end_f:
             break
         if (idx - start_f) % step == 0:
-            frames.append(np.ascontiguousarray(bgr[:, :, ::-1]))
+            frames.append(apply_crop(np.ascontiguousarray(bgr[:, :, ::-1]), crop))
             if max_frames and len(frames) >= max_frames:
                 break
         idx += 1
@@ -269,6 +294,35 @@ def gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
     return y.reshape(shp)
 
 
+def push_pull_fill(img: torch.Tensor, known: torch.Tensor) -> torch.Tensor:
+    """
+    (C, H, W) の未知画素（known=False）を push-pull 補間で埋める。
+    push: 重み付き平均で 1/2 縮小を繰り返す。pull: 粗いレベルを双一次拡大し、重みの足りない画素に混ぜる。
+    """
+    v = img * known[None].float()
+    w = known.float()[None]
+    vals, wts = [v], [w]
+    while vals[-1].shape[-1] > 1 or vals[-1].shape[-2] > 1:
+        v, w = vals[-1], wts[-1]
+        h, wd = v.shape[-2:]
+        ph, pw = h % 2, wd % 2
+        vp = F.pad(v[None], (0, pw, 0, ph), mode="replicate")[0]
+        wp = F.pad(w[None], (0, pw, 0, ph), mode="replicate")[0]
+        sv = F.avg_pool2d(vp[None], 2)[0] * 4.0
+        sw = F.avg_pool2d(wp[None], 2)[0] * 4.0
+        nw = (sw / 4.0).clamp(max=1.0)
+        nv = torch.where(sw > 0, sv / sw.clamp(min=1e-6), torch.zeros_like(sv)) * nw
+        vals.append(nv)
+        wts.append(nw)
+    for lv in range(len(vals)):
+        vals[lv] = torch.where(wts[lv] > 0, vals[lv] / wts[lv].clamp(min=1e-6), vals[lv])
+    for lv in range(len(vals) - 2, -1, -1):
+        up = F.interpolate(vals[lv + 1][None], size=vals[lv].shape[-2:], mode="bilinear", align_corners=False)[0]
+        w = wts[lv]
+        vals[lv] = w * vals[lv] + (1.0 - w) * up
+    return vals[0]
+
+
 # -------------------------
 # グローバル最小二乗
 # -------------------------
@@ -355,28 +409,58 @@ class Reconstructor:
         ignore = torch.zeros((H, W), dtype=torch.bool, device=self.dev)
         for (x, y, w, h) in self.ignore_rects:
             ignore[max(0, y):min(H, y + h), max(0, x):min(W, x + w)] = True
+        in_text = torch.zeros((H, W), dtype=torch.bool, device=self.dev)
+        for (x, y, w, h) in a.text_rects:
+            in_text[max(0, y):min(H, y + h), max(0, x):min(W, x + w)] = True
+        has_text = bool(a.text_rects)
 
         span = a.static_span
         ratios = []
+        use_static = a.static_mask and self.n > 1
         for k in range(self.n):
             g = self._gray_tensor(k)
-            if a.static_mask and self.n > 1:
-                cands = [j for j in (k - span, k + span) if 0 <= j < self.n]
-                if not cands:
-                    cands = [max(0, min(self.n - 1, k + (span if k == 0 else -span)))]
-                diff = None
-                for j in cands:
-                    dj = (g - self._gray_tensor(j)).abs()
-                    diff = dj if diff is None else torch.minimum(diff, dj)
-                static = (diff < a.static_diff) & (gradient_mag(g) > a.static_grad)
-                dens = box_blur(static.float(), 5)
-                static = dens > 0.3
-                static = dilate(static, a.static_dilate)
+            if use_static or has_text:
+                gm = gradient_mag(g)
+                if use_static:
+                    cands = [j for j in (k - span, k + span) if 0 <= j < self.n]
+                    if not cands:
+                        cands = [max(0, min(self.n - 1, k + (span if k == 0 else -span)))]
+                    diff = None
+                    for j in cands:
+                        dj = (g - self._gray_tensor(j)).abs()
+                        diff = dj if diff is None else torch.minimum(diff, dj)
+                    flat = diff < a.static_diff          # 静止（勾配条件なし）
+                    edge = flat & (gm > a.static_grad)   # 静止エッジ
+                else:
+                    flat = torch.zeros_like(g, dtype=torch.bool)
+                    edge = flat.clone()
+                if has_text:
+                    # テキスト矩形内は静止条件なしで勾配の高い画素を文字とみなす（動くティッカー用）
+                    edge = edge | (in_text & (gm > a.static_grad))
+                dens = box_blur(edge.float(), 5) > 0.3
+                static = dilate(dens, a.static_dilate)
+                # ハロー: 静止エッジ周辺の静止画素（文字のグロー等）とテキスト矩形内の周辺画素も除外
+                if a.static_halo > 0:
+                    static = static | (flat & ~in_text & dilate(dens, 2 * a.static_halo + 1))
+                if has_text and a.text_halo > 0:
+                    static = static | (in_text & dilate(dens, 2 * a.text_halo + 1))
             else:
                 static = torch.zeros_like(g, dtype=torch.bool)
             ov = static | ignore
-            ratios.append(float(ov.float().mean().item()))
             self.overlay.append(ov.cpu().numpy())
+        # 時間方向クロージング: 前後 j フレーム（両側）でマスクされている画素はこのフレームでもマスク（光沢アニメ等の抜け対策）
+        nclose = max(0, min(3, int(a.static_close)))
+        if nclose > 0 and (use_static or has_text):
+            for k in range(self.n):
+                m = self.overlay[k]
+                for j in range(1, nclose + 1):
+                    if k - j >= 0 and k + j < self.n:
+                        m = m | (self.overlay[k - j] & self.overlay[k + j])
+                self.overlay[k] = m
+        for k in range(self.n):
+            ratios.append(float(self.overlay[k].mean()))
+            g = self._gray_tensor(k)
+            ov = torch.from_numpy(self.overlay[k]).to(self.dev)
             # 鮮明度（ラプラシアン絶対値のボックス平均）を 1/4 で保持
             s = box_blur(laplacian_abs(g), 15)
             self.sharp_q.append(downsample_area(s, (max(1, H // 4), max(1, W // 4))).cpu().numpy().astype(np.float16))
@@ -758,6 +842,7 @@ class Reconstructor:
         out_sharp = np.zeros((Hc, Wc, 3), dtype=np.uint8)
         out_mean = np.zeros((Hc, Wc, 3), dtype=np.uint8)
         coverage = np.zeros((Hc, Wc), dtype=np.uint16)
+        coverage_g = np.zeros((Hc, Wc), dtype=np.uint16)
         holes = 0
         dev = self.dev
         xs_all = torch.arange(Wc, device=dev, dtype=torch.float32)
@@ -826,8 +911,34 @@ class Reconstructor:
             out_mean[y0:y1] = to_u8(mean)
             out_sharp[y0:y1] = to_u8(sharp)
             coverage[y0:y1] = cnt_c.cpu().numpy().astype(np.uint16)
-        log(f"[render] done {time.time() - t0:.1f}s, uncovered px={holes}")
-        return {"median": out_med, "sharp": out_sharp, "mean": out_mean, "coverage": coverage}
+            coverage_g[y0:y1] = cnt_g.cpu().numpy().astype(np.uint16)
+        fallback = int(((coverage_g > 0) & (coverage == 0)).sum())
+        log(f"[render] done {time.time() - t0:.1f}s, uncovered px={holes}, fallback (no clean sample) px={fallback}")
+        return {"median": out_med, "sharp": out_sharp, "mean": out_mean, "coverage": coverage, "coverage_geom": coverage_g}
+
+    # ---- 後処理: クリーン標本の無い/少ない画素の穴埋め ----
+    def fill_holes(self, res: Dict[str, np.ndarray]) -> int:
+        """
+        幾何的には覆われているのにクリーン標本が無い画素（テロップが常に載っていた場所）と、
+        クリーン標本が「min_clean 件未満かつ被覆数の min_clean_pct % 未満」の画素を周囲から埋める。
+        --hole-fill inpaint: push-pull 補間、blur: ぼかした値で置換。戻り値: 埋めた画素数。
+        """
+        a = self.args
+        cg, cc = res["coverage_geom"].astype(np.int32), res["coverage"].astype(np.int32)
+        fill = (cg > 0) & ((cc == 0) | ((cc < a.min_clean) & (cc < a.min_clean_pct / 100.0 * cg)))
+        n = int(fill.sum())
+        if n == 0 or a.hole_fill == "none":
+            return 0
+        fill_t = torch.from_numpy(fill).to(self.dev)
+        for key in ("median", "mean", "sharp"):
+            img = torch.from_numpy(res[key]).to(self.dev).permute(2, 0, 1).float()  # 3,H,W
+            if a.hole_fill == "blur":
+                b = box_blur(box_blur(img, 2 * 8 + 1), 2 * 8 + 1)
+                out = torch.where(fill_t[None], b, img)
+            else:
+                out = push_pull_fill(img, ~fill_t)
+            res[key] = (out.clamp(0, 255) + 0.5).byte().permute(1, 2, 0).cpu().numpy()
+        return n
 
     def save_debug_overlay(self, out_dir: Path) -> None:
         idxs = sorted(set([0, self.n // 2, self.n - 1]))
@@ -868,6 +979,10 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--start", type=float, default=0.0, help="動画の開始秒")
     src.add_argument("--duration", type=float, default=None, help="動画の使用秒数")
     src.add_argument("--max-frames", type=int, default=0, help="最大フレーム数（0=無制限）")
+    src.add_argument("--start-frame", type=int, default=None, help="開始フレーム番号（0 始まり。--start より優先）")
+    src.add_argument("--end-frame", type=int, default=None, help="終了フレーム番号（両端含む。--duration より優先）")
+    src.add_argument("--crop", type=parse_rect, default=None,
+                    help="読み込み時に切り出す矩形 x,y,w,h（元動画座標）。--ignore-rect / --text-rect はクロップ後の座標")
     ap.add_argument("--out", type=str, required=True, help="出力ディレクトリ")
     ap.add_argument("--device", type=str, default="auto", help="cuda / cpu / auto")
 
@@ -886,6 +1001,9 @@ def build_parser() -> argparse.ArgumentParser:
     al.add_argument("--gn-iters", type=int, default=15, help="Gauss-Newton の各レベル反復回数")
     al.add_argument("--ignore-rect", type=parse_rect, action="append", default=[],
                     help="常に除外する矩形 x,y,w,h（複数指定可）")
+    al.add_argument("--text-rect", type=parse_rect, action="append", default=[],
+                    help="動くテロップ帯 x,y,w,h（複数指定可）。矩形内は静止条件なしで勾配の高い画素を文字としてマスク")
+    al.add_argument("--text-halo", type=int, default=4, help="テキスト矩形内で文字マスクを広げる半径 px（default: 4）")
 
     st = ap.add_argument_group("静止オーバーレイ検出")
     st.add_argument("--no-static-mask", action="store_true", help="静止オーバーレイ検出を無効化")
@@ -893,6 +1011,10 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--static-diff", type=float, default=0.03, help="静止とみなす輝度差（0-1, default: 0.03）")
     st.add_argument("--static-grad", type=float, default=0.08, help="オーバーレイとみなす勾配下限（default: 0.08）")
     st.add_argument("--static-dilate", type=int, default=7, help="マスク膨張サイズ（default: 7）")
+    st.add_argument("--static-halo", type=int, default=12,
+                    help="静止エッジの周囲 N px 以内で静止している画素もマスク（文字のグロー対策, default: 12, 0=無効）")
+    st.add_argument("--static-close", type=int, default=3,
+                    help="前後 N フレームの両方でマスクされている画素をマスク（光沢アニメ対策, 0-3, default: 3）")
 
     rd = ap.add_argument_group("合成")
     rd.add_argument("--canvas-scale", type=str, default="auto",
@@ -901,6 +1023,12 @@ def build_parser() -> argparse.ArgumentParser:
     rd.add_argument("--inlier-tol", type=float, default=0.06, help="中央値からの許容差（0-1, default: 0.06）")
     rd.add_argument("--sharp-top", type=float, default=0.3,
                     help="recon_sharp で平均するインライアの鮮明度上位比率（default: 0.3）")
+    rd.add_argument("--hole-fill", type=str, default="inpaint", choices=["inpaint", "blur", "none"],
+                    help="クリーン標本が無い/少ない画素の穴埋め: inpaint（push-pull 補間, default）, blur, none")
+    rd.add_argument("--min-clean", type=int, default=12,
+                    help="穴埋め対象とみなすクリーン標本数の上限（件数未満かつ --min-clean-pct 未満で対象, default: 12）")
+    rd.add_argument("--min-clean-pct", type=float, default=25.0,
+                    help="穴埋め対象とみなすクリーン標本の被覆数に対する割合 %%（default: 25）")
     rd.add_argument("--no-render", action="store_true", help="位置推定のみ行い画像を出力しない")
     return ap
 
@@ -911,6 +1039,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     a.pair_offsets = sorted(set(int(v) for v in a.pairs.split(",") if v.strip()))
     a.static_mask = not a.no_static_mask
     a.ignore_rects = a.ignore_rect
+    a.text_rects = a.text_rect
     if not a.video and not a.frames:
         ap.error("--video または --frames を指定してください")
     if a.canvas_scale != "auto":
@@ -927,11 +1056,12 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     t_all = time.time()
     if a.video:
-        frames, eff_fps = load_frames_from_video(Path(a.video), a.every, a.fps, a.start, a.duration, a.max_frames)
+        frames, eff_fps = load_frames_from_video(Path(a.video), a.every, a.fps, a.start, a.duration, a.max_frames,
+                                                 a.start_frame, a.end_frame, a.crop)
         log(f"[load] {len(frames)} frames from {a.video} (effective {eff_fps:.2f} fps)")
     else:
         paths = expand_globs(a.frames)
-        frames = load_frames_from_paths(paths, a.every, a.max_frames)
+        frames = load_frames_from_paths(paths, a.every, a.max_frames, a.start_frame, a.end_frame, a.crop)
         log(f"[load] {len(frames)} frames from {len(paths)} files")
     if len(frames) < 2:
         sys.exit("フレームが 2 枚未満です")
@@ -958,6 +1088,9 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if not a.no_render:
         res = rc.render(al)
+        nfill = rc.fill_holes(res)
+        if nfill:
+            log(f"[postfx] hole fill ({a.hole_fill}): {nfill} px")
         Image.fromarray(res["median"]).save(out_dir / "recon_median.png")
         Image.fromarray(res["sharp"]).save(out_dir / "recon_sharp.png")
         Image.fromarray(res["mean"]).save(out_dir / "recon_mean.png")

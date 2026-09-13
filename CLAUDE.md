@@ -195,8 +195,56 @@ python panorama_recon.py --video input.mp4 --model translation --out pano_out
 - Frame-rate: keep the native 30 fps for zoom videos; at 6 fps the per-pair scale change can exceed `--scale-max`
   and frames lose overlap.
 - `--ignore-rect x,y,w,h` adds always-excluded regions (semicolon-separated in the GUI).
+- Frame range / crop (added 2026-09-13): `--start-frame N --end-frame M` (0-based, inclusive; override `--start`/`--duration`)
+  and `--crop x,y,w,h` (source coordinates, applied at load; `--ignore-rect`/`--text-rect` are then in cropped coordinates).
+  The GUI's Panorama tab has a "Trim / Crop..." button opening `trim_dialog.py`: start/end previews, a range bar with two
+  handles, -1/+1 buttons, and drag-to-draw rectangles (crop with handles / ignore / text) whose results fill the tab's fields.
+  Thumbnails are decoded in a background thread (OpenCV), capped at 1500 (strided beyond that; other frames are seeked on demand).
+- Telop / ticker residue (added 2026-09-13, same as the Web version):
+  - `--text-rect x,y,w,h` (repeatable): bands with *moving* text (tickers). Inside, high-gradient pixels are masked per frame
+    without the static test, grown by `--text-halo` px (default 4). Required for moving telops; the static detector cannot see them.
+  - `--static-halo N` (default 12): static pixels within N px of a static edge are masked too. Catches the flat white glow
+    around telop text, which has low gradient and otherwise leaks into the median. Side effect: more mask around static edges.
+  - `--static-close N` (default 3): a pixel masked in both frames k-j and k+j (j=1..N) is masked in frame k. Fixes frames where a
+    shine animation sweeping over the text breaks the static test for a moment.
+  - `--hole-fill inpaint|blur|none` (default inpaint) with `--min-clean 12 --min-clean-pct 25`: canvas pixels that are covered
+    geometrically but have no clean sample (telop always on top of them, typically at the canvas ends), or fewer than 12 clean
+    samples that are also under 25% of the covering frames, are filled by push-pull interpolation (or blurred). Filled areas lose
+    their real detail (a dense ticker band becomes a smooth strip). The log prints `fallback (no clean sample) px` and the fill count.
+  - Do not widen the static test to k±2span "any match": background coincidences inflate the mask (14% → 41% measured).
 - If a static logo sits at a canvas edge covered only by frames where it is masked, the render falls back to the
   unmasked median there (logo remains). `coverage.png` shows such regions as dark.
+
+---
+
+## Panorama Reconstruction - WebGPU 版 (docs/webapp/)
+
+`docs/webapp/` は `panorama_recon.py` のブラウザ移植。torch / CUDA 不要で、WebGPU 対応ブラウザ（Chrome / Edge 113+,
+Firefox 141+, Safari 26+）と任意の GPU（NVIDIA / AMD / Intel）で動く。配布物は静的ファイルのみ。詳細は `docs/webapp/README.md`。
+
+```bash
+cd web && python -m http.server 8765   # ES モジュールのため file:// では動かない
+# → http://127.0.0.1:8765/index.html
+```
+
+- 粗探索は FFT ではなく階層的総当たり NCC（1/16 解像度で全シフト → 1/4 解像度で ±12 px 窓）。スケール格子も
+  1/16 で 0.02 刻み → 1/4 で `scale_step` 刻みの 2 段階。それ以外（静止オーバーレイ検出、Gauss-Newton、
+  IRLS グローバル解、中央値 / インライア平均 / 鮮明度上位平均の合成）は Python 版と同じ手順を WGSL / JS で実装
+- Gauss-Newton は全反復・全レベルを 1 コマンドバッファに詰め、4x4 正規方程式の求解まで GPU 上で行う（読み戻しはペア
+  バッチごと 1 回）。MAD はヒストグラム近似
+- 結果は Python 版とほぼ一致（sample.mp4: 残差中央値 0.02 px、スケール 1.0000-1.0008。sample3_zoom.mp4: 最大スケール
+  1.9205 対 1.9206）。RTX 3080 Ti で sample.mp4 136 フレームが 30 s（Python + CUDA は 53 s）
+- 全フレームを RGBA8 で GPU 常駐（1080p で 8 MB / フレーム）。足りなければ UI の `input scale` / `fps` / `max frames` で削減
+- 動画はブラウザの `<video>` シークで抽出するため、フレーム集合が Python 版と 1 フレームずれることがある
+- テロップ対策（2026-09-13 追加、Python 版にも同じオプションあり）: `text rects`（動くティッカー帯を勾配でマスク）、`halo`（静止エッジ周辺の
+  静止画素＝文字のグローもマスク）、`close`（前後フレームでマスクされていれば埋める＝光沢アニメ対策）、`hole fill`
+  （クリーン標本が無い/少ない画素を push-pull 補間で埋める）。副作用（埋めた領域の細部消失、マスク増加）はオプションで制御
+- 注意: WGSL で `a || b` をワークグループバリアの前に置くと誤コンパイルされる環境があり、`gn_accum` では `max()` で判定
+- Trim / Crop パネル（`trim.js`、2026-09-13）: 動画選択時に開く。`<video>` 2 本で開始/終了フレームを表示、範囲バー + -1/+1、
+  fps は requestVideoFrameCallback で実測、クロップ/無視/テキスト矩形をプレビュー上でドラッグ指定（無視/テキストはクロップ後座標で
+  パラメータ欄へ書き戻す）。抽出は `drawImage` の元矩形指定でクロップ
+- ファイル: `index.html` (UI), `app.js` (入出力), `trim.js` (トリム/クロップ), `gpu.js` (基盤), `shaders_img.js` / `shaders_align.js` /
+  `shaders_render.js` (WGSL), `recon.js` (位置合わせ), `render.js` (合成), `postfx.js` (穴埋め), `solve.js` (CPU 最小二乗)
 
 ---
 

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panorama Reconstruct (WebGPU)</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f5f5f7; --fg: #1d1d1f; --panel: #fff; --line: #d0d0d5; --acc: #2d6cdf; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #17171a; --fg: #e8e8ec; --panel: #222226; --line: #3a3a40; --acc: #6ea0ff; } }
+  body { margin: 0; padding: 12px 16px; font: 13px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  h1 { font-size: 17px; margin: 0 0 8px; }
+  .grid { display: grid; grid-template-columns: minmax(340px, 1fr) 2fr; gap: 12px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 0 0 8px; padding: 6px 10px 8px; background: var(--panel); }
+  legend { font-weight: 600; padding: 0 4px; }
+  .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; flex-wrap: wrap; }
+  .row label { min-width: 110px; }
+  input[type=number], input[type=text], select { width: 90px; padding: 2px 4px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--fg); }
+  input.wide { width: 200px; }
+  button { padding: 5px 12px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel); color: var(--fg); cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--acc); color: #fff; border-color: var(--acc); }
+  button.tab.active { border-color: var(--acc); color: var(--acc); font-weight: 600; }
+  #log { width: 100%; height: 220px; box-sizing: border-box; font: 12px/1.4 ui-monospace, Consolas, monospace; white-space: pre; overflow: auto;
+         background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px; margin: 0; }
+  #view { overflow: auto; max-height: 70vh; border: 1px solid var(--line); border-radius: 6px; background: #333; }
+  #view canvas { max-width: 100%; display: block; image-rendering: auto; }
+  progress { width: 100%; height: 10px; }
+  .hint { color: #888; font-size: 12px; }
+  .drop { max-width: 900px; border: 2px dashed var(--line); border-radius: 8px; padding: 10px; margin-bottom: 8px; background: var(--panel); }
+  .drop.over { border-color: var(--acc); background: color-mix(in srgb, var(--acc) 10%, var(--panel)); }
+  details > summary { cursor: pointer; font-weight: 600; margin: 4px 0 8px; }
+  #trim { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-bottom: 8px; }
+  .trim-previews { display: flex; gap: 8px; flex-wrap: wrap; }
+  .trim-col { flex: 1 1 560px; min-width: 320px; max-width: 880px; }
+  .trim-help { margin: 4px 0 2px; line-height: 1.5; }
+  .trim-help b { font-weight: 600; }
+  .trim-help .sw { display: inline-block; width: 10px; height: 10px; border: 2px solid; margin: 0 4px -1px 0; }
+  .trim-wrap { position: relative; display: block; line-height: 0; }
+  .trim-wrap video { width: 100%; display: block; background: #202020; }
+  .trim-wrap canvas { position: absolute; left: 0; top: 0; cursor: crosshair; touch-action: none; }
+  .trim-bar { position: relative; height: 30px; margin: 8px 0 4px; background: #d8d8dc; border-radius: 4px; cursor: ew-resize; touch-action: none; user-select: none; }
+  .trim-range { position: absolute; top: 11px; height: 8px; background: var(--acc); opacity: .7; }
+  .trim-handle { position: absolute; top: 0; width: 12px; height: 30px; margin-left: -6px; background: var(--acc); border-radius: 3px; box-shadow: 0 0 0 1px #fff inset; }
+  #trim .row label { min-width: 60px; }
+  #trim input[type=number] { width: 70px; }
+</style>
+</head>
+<body>
+<h1>Panorama Reconstruct (WebGPU 版)</h1>
+  <div id="drop" class="drop">
+  <div class="row"><input type="file" id="file" accept="video/*,image/*" multiple> <span id="fileInfo" class="hint"></span></div>
+  <div class="hint">動画 1 本、またはフレーム画像を複数選択。ここに動画ファイルやフレーム画像をドロップしても可</div>
+  <div class="row" style="margin-top:6px">
+    <button id="run" class="primary">実行</button>
+    <button id="cancel" disabled>中断</button>
+    <button id="dlPositions" disabled>positions.csv</button>
+    <button id="dlPairs" disabled>pairs.csv</button>
+  </div>
+<div class="row"><progress id="progress" value="0" max="1"></progress><span id="stage" class="hint">idle</span></div>
+</div>
+<details id="trimBox" open hidden><summary>Trim / Crop</summary><div id="trim"></div></details>
+<div class="grid">
+<div>
+  <details id="params">
+  <summary>パラメータ</summary>
+  <fieldset><legend>入力</legend>
+    <div class="row"><label>fps（動画）</label><input type="number" id="fps" value="10" step="1" min="0.1"></div>
+    <div class="row"><label>start (s)</label><input type="number" id="start" value="0" step="0.1"><label>duration (s)</label><input type="number" id="duration" value="0" step="0.1"></div>
+    <div class="row"><label>max frames</label><input type="number" id="maxFrames" value="0" step="1"><label>every (画像)</label><input type="number" id="every" value="1" step="1"></div>
+    <div class="row"><label>input scale</label><input type="number" id="inputScale" value="1.0" step="0.05" min="0.1" max="1"><span class="hint">フレーム縮小率（メモリ/速度）</span></div>
+  </fieldset>
+  <fieldset><legend>位置合わせ</legend>
+    <div class="row"><label>model</label><select id="model"><option value="translation">translation</option><option value="scale" selected>scale</option><option value="similarity">similarity</option></select></div>
+    <div class="row"><label>pairs</label><input type="text" id="pairs" value="1,2,4"></div>
+    <div class="row"><label>min overlap</label><input type="number" id="minOverlap" value="0.15" step="0.01"><label>coarse tol</label><input type="number" id="coarseTol" value="2.0" step="0.5"></div>
+    <div class="row"><label>scale max</label><input type="number" id="scaleMax" value="0.06" step="0.01"><label>scale step</label><input type="number" id="scaleStep" value="0.004" step="0.001"></div>
+    <div class="row"><label>fine scale</label><input type="number" id="fineScale" value="1.0" step="0.25" min="0.25" max="1"><label>GN iters</label><input type="number" id="gnIters" value="15" step="1"></div>
+    <div class="row"><label>ignore rects</label><input type="text" id="ignoreRects" class="wide" placeholder="x,y,w,h; x,y,w,h"></div>
+    <div class="row"><label>text rects</label><input type="text" id="textRects" class="wide" placeholder="x,y,w,h; x,y,w,h"><label>text halo</label><input type="number" id="textHalo" value="4" step="1" style="width:60px"><span class="hint">動くテロップ帯（矩形内は勾配で文字をマスクし、text halo px だけ広げる）</span></div>
+  </fieldset>
+  <fieldset><legend>静止オーバーレイ検出</legend>
+    <div class="row"><label><input type="checkbox" id="staticMask" checked> 有効</label><label>span</label><input type="number" id="staticSpan" value="6" step="1"></div>
+    <div class="row"><label>diff</label><input type="number" id="staticDiff" value="0.03" step="0.01"><label>grad</label><input type="number" id="staticGrad" value="0.08" step="0.01"></div>
+    <div class="row"><label>dilate</label><input type="number" id="staticDilate" value="7" step="2"><label>halo</label><input type="number" id="staticHalo" value="12" step="1"><label>close</label><input type="number" id="staticClose" value="3" step="1" min="0" max="3"><span class="hint">halo: 静止エッジ周辺の静止画素も除外する半径 px（グロー対策）。close: 前後 N フレームでマスクされていれば埋める（光沢アニメ対策）</span></div>
+  </fieldset>
+  <fieldset><legend>合成</legend>
+    <div class="row"><label>canvas scale</label><input type="text" id="canvasScale" value="auto"><label><input type="checkbox" id="noRender"> 位置推定のみ</label></div>
+    <div class="row"><label>inlier tol</label><input type="number" id="inlierTol" value="0.06" step="0.01"><label>sharp top</label><input type="number" id="sharpTop" value="0.3" step="0.05"></div>
+    <div class="row"><label>hole fill</label><select id="holeFill"><option value="inpaint" selected>inpaint</option><option value="blur">blur</option><option value="none">none</option></select><label>min clean</label><input type="number" id="minCleanCnt" value="12" step="1" style="width:60px"> 件 / <input type="number" id="minCleanPct" value="25" step="1" style="width:60px"> %<span class="hint">クリーン標本が無い、または「件数未満かつ被覆の%未満」の画素を周囲から埋める</span></div>
+    <div class="row"><label>stack budget MB</label><input type="number" id="stackBudget" value="128" step="32"><label>level cache MB</label><input type="number" id="levelCache" value="768" step="128"></div>
+  </fieldset>
+  </details>
+</div>
+<div>
+  <pre id="log"></pre>
+  <div class="row" style="margin-top:8px"><span id="tabs"></span><button id="dlPng">PNG 保存</button><span id="viewInfo" class="hint"></span></div>
+  <div id="view"></div>
+</div>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
