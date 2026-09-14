@@ -14,6 +14,38 @@ function log(msg) {
   console.log(msg);
 }
 let gpu = null, rc = null, running = false;
+let gpuError = null;      // WebGPU 初期化失敗の理由（Error）。ページ表示時に判定して画面に出す
+
+// WebGPU の利用可否をページ表示時に判定し、結果を見出し直下のバナーに表示する。
+// 失敗時は実行ボタンを無効化する（Chrome の「グラフィック アクセラレーション」設定が OFF、
+// 非セキュアコンテキスト、非対応ブラウザなど。「実行」まで気付けないのを避ける）
+function showGpuStatus(kind, text) {
+  const el = $("gpuStatus");
+  el.className = `banner ${kind}`;
+  el.textContent = text;
+  el.hidden = false;
+}
+async function ensureGpu() {
+  if (gpu) return gpu;
+  try {
+    gpu = await Gpu.create(log);
+    gpuError = null;
+    gpu.device.lost.then((info) => {
+      gpu = null;
+      if (info.reason !== "destroyed") {
+        showGpuStatus("err", `GPU デバイスが失われました（${info.reason}: ${info.message}）。ページを再読み込みしてください`);
+      }
+    });
+    showGpuStatus("ok", `WebGPU 利用可能: ${gpu.info || "(adapter info unavailable)"}`);
+    return gpu;
+  } catch (e) {
+    gpuError = e;
+    showGpuStatus("err", `WebGPU を利用できないため、この Web 版は動作しません。\n${e.message}`);
+    $("run").disabled = true;
+    log(`[error] ${e.message}`);
+    throw e;
+  }
+}
 let selectedFiles = [];   // ファイル入力または D&D で選ばれたファイル
 let outPrefix = "";       // 保存ファイル名の接頭辞（入力ファイル名から拡張子を除いたもの）
 const results = {};   // name -> {canvas, w, h}
@@ -179,7 +211,7 @@ async function run() {
   const tAll = performance.now();
   try {
     const args = readArgs();
-    if (!gpu) gpu = await Gpu.create(log);
+    await ensureGpu();
     const files = selectedFiles;
     if (!files.length) throw new Error("動画ファイルまたはフレーム画像を選択（またはドロップ）してください");
     outPrefix = files[0].name.replace(/\.[^.]+$/, "") + "_";
@@ -245,7 +277,7 @@ async function run() {
       rc = null;
     }
     running = false;
-    $("run").disabled = false; $("cancel").disabled = true;
+    $("run").disabled = !!gpuError; $("cancel").disabled = true;
     setProgress("idle", 0);
   }
 }
@@ -293,4 +325,5 @@ document.addEventListener("drop", (e) => {
     try { $("file").files = e.dataTransfer.files; } catch (err) { /* 一部ブラウザでは不可 */ }
   }
 });
-if (!navigator.gpu) log("[warn] このブラウザは WebGPU に対応していません。Chrome / Edge 113+, Firefox 141+, Safari 26+ を使用してください");
+// ページ表示時に WebGPU を初期化して可否を表示（失敗しても例外は握りつぶす。バナーとログに出ている）
+ensureGpu().catch(() => {});

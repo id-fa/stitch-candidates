@@ -27,6 +27,10 @@
   #view canvas { max-width: 100%; display: block; image-rendering: auto; }
   progress { width: 100%; height: 10px; }
   .hint { color: #888; font-size: 12px; }
+  .banner { max-width: 900px; padding: 8px 12px; margin: 0 0 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); white-space: pre-line; }
+  .banner.err { background: #fdecec; border-color: #e39a9a; color: #8b1a1a; font-weight: 500; }
+  .banner.ok { color: #888; font-size: 12px; padding: 4px 10px; }
+  @media (prefers-color-scheme: dark) { .banner.err { background: #3a1c1c; border-color: #8a3a3a; color: #ffb3b3; } }
   .drop { max-width: 900px; border: 2px dashed var(--line); border-radius: 8px; padding: 10px; margin-bottom: 8px; background: var(--panel); }
   .drop.over { border-color: var(--acc); background: color-mix(in srgb, var(--acc) 10%, var(--panel)); }
   details > summary { cursor: pointer; font-weight: 600; margin: 4px 0 8px; }
@@ -50,6 +54,7 @@
 </head>
 <body>
 <h1>Panorama Reconstruct (WebGPU 版)</h1>
+<div id="gpuStatus" class="banner" hidden></div>
   <div id="drop" class="drop">
   <div class="row"><input type="file" id="file" accept="video/*,image/*" multiple> <span id="fileInfo" class="hint"></span></div>
   <div class="hint">動画 1 本、またはフレーム画像を複数選択。ここに動画ファイルやフレーム画像をドロップしても可</div>

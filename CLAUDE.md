@@ -252,6 +252,9 @@ cd web && python -m http.server 8765   # ES モジュールのため file:// で
 - Trim / Crop パネル（`trim.js`、2026-09-13）: 動画選択時に開く。`<video>` 2 本で開始/終了フレームを表示、範囲バー + -1/+1、
   fps は requestVideoFrameCallback で実測、クロップ/無視/テキスト矩形をプレビュー上でドラッグ指定（無視/テキストはクロップ後座標で
   パラメータ欄へ書き戻す）。抽出は `drawImage` の元矩形指定でクロップ
+- WebGPU の可否はページ表示時に `Gpu.create` を先行実行して判定し（`app.js` の `ensureGpu`）、`#gpuStatus` バナーに表示。
+  失敗時は「実行」を無効化。`gpu.js` の例外メッセージが原因別（非対応 / 非セキュアコンテキスト / アダプタ取得不可 =
+  グラフィックアクセラレーション OFF / デバイス作成失敗）の対処を含む（2026-09-14 追加）
 - ファイル: `index.html` (UI), `app.js` (入出力), `trim.js` (トリム/クロップ), `gpu.js` (基盤), `shaders_img.js` / `shaders_align.js` /
   `shaders_render.js` (WGSL), `recon.js` (位置合わせ), `render.js` (合成), `postfx.js` (穴埋め), `solve.js` (CPU 最小二乗)
 

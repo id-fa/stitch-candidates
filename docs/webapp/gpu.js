@@ -10,9 +10,23 @@ let _bufId = 1;
 
 export class Gpu {
   static async create(log) {
-    if (!navigator.gpu) throw new Error("このブラウザは WebGPU に対応していません（Chrome / Edge 113+, Firefox 141+, Safari 26+）");
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) throw new Error("WebGPU アダプタを取得できません（GPU / ドライバ / ブラウザ設定を確認）");
+    if (!navigator.gpu) {
+      if (window.isSecureContext === false)
+        throw new Error("WebGPU は https:// または http://localhost でのみ使えます（現在のページは非セキュアコンテキスト）。" +
+                        "http://127.0.0.1 や localhost 経由で開いてください");
+      throw new Error("このブラウザは WebGPU に対応していないか、WebGPU が無効化されています。\n" +
+                      "対応ブラウザ: Chrome / Edge 113+, Firefox 141+, Safari 26+\n" +
+                      "Firefox: about:config で dom.webgpu.enabled を true に。Safari: 設定 → 機能フラグ → WebGPU を有効に");
+    }
+    let adapter = null;
+    try { adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" }); } catch (e) { /* null 扱い */ }
+    if (!adapter) {
+      try { adapter = await navigator.gpu.requestAdapter(); } catch (e) { /* null 扱い */ }
+    }
+    if (!adapter) throw new Error("WebGPU アダプタを取得できません。ブラウザの GPU（グラフィック）アクセラレーションが無効か、GPU / ドライバがブロックされています。\n" +
+                                  "Chrome / Edge: 設定 → システム → 「グラフィック アクセラレーションが使用可能な場合は使用する」をオンにしてブラウザを再起動。" +
+                                  "chrome://gpu（edge://gpu）で WebGPU の状態を確認できます。Linux では chrome://flags/#enable-unsafe-webgpu が必要な場合があります。\n" +
+                                  "リモートデスクトップや仮想マシンでは GPU が使えないことがあります");
     const L = adapter.limits;
     const requiredLimits = {
       maxStorageBufferBindingSize: L.maxStorageBufferBindingSize,
@@ -21,13 +35,16 @@ export class Gpu {
       maxComputeWorkgroupStorageSize: L.maxComputeWorkgroupStorageSize,
       maxComputeInvocationsPerWorkgroup: Math.max(256, L.maxComputeInvocationsPerWorkgroup),
     };
-    const device = await adapter.requestDevice({ requiredLimits });
+    let device;
+    try { device = await adapter.requestDevice({ requiredLimits }); }
+    catch (e) { throw new Error(`WebGPU デバイスを作成できません（${e.message || e}）。GPU ドライバの更新、または別のブラウザをお試しください`); }
     const g = new Gpu(adapter, device, log);
     let info = "";
     try {
       const ai = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : null);
       if (ai) info = [ai.vendor, ai.architecture, ai.description].filter(Boolean).join(" / ");
     } catch (e) { /* ignore */ }
+    g.info = info;
     log(`[device] WebGPU ${info || "(adapter info unavailable)"}; maxBufferSize=${(device.limits.maxBufferSize / 1048576).toFixed(0)}MB, ` +
         `maxStorageBinding=${(device.limits.maxStorageBufferBindingSize / 1048576).toFixed(0)}MB`);
     device.lost.then((info) => { log(`[device] LOST: ${info.reason} ${info.message}`); });
