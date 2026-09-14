@@ -5,6 +5,7 @@ import { Reconstructor, DEFAULTS } from "./recon.js";
 import { render } from "./render.js";
 import { fillHoles } from "./postfx.js";
 import { TrimPanel } from "./trim.js";
+import { FrameStore, openVideoSource, openImageSource, isVideoFile } from "./frames.js";
 
 const $ = (id) => document.getElementById(id);
 const logEl = $("log");
@@ -59,34 +60,49 @@ try { const v = localStorage.getItem("memLimitGB"); if (v !== null && v !== "") 
 $("memLimit").onchange = () => { try { localStorage.setItem("memLimitGB", $("memLimit").value); } catch (e) { /* ignore */ } };
 const memLimitBytes = () => Math.max(0, num("memLimit", 8)) * 1073741824;
 
-// GPU バッファ総量の見積もり（recon.js / render.js の確保に合わせる）。キャンバス出力（位置合わせ後に決まる）は含まない
-function estimateMemory(n, W, H, args0) {
+// GPU バッファの見積もり（recon.js / render.js の確保に合わせる）。キャンバス出力は位置合わせ後に決まるので概算で余裕を取る
+function estimateMemory(W, H, args0) {
   const args = { ...DEFAULTS, ...args0 };
   const cs = args.coarseScale;
   const hc = Math.max(16, Math.round(H * cs)), wc = Math.max(16, Math.round(W * cs));
   const h16 = Math.max(16, Math.round(hc / 4)), w16 = Math.max(16, Math.round(wc / 4));
   const Hq = Math.max(1, Math.floor(H / 4)), Wq = Math.max(1, Math.floor(W / 4));
-  const frames = n * W * H * 4;
-  const pre = n * (wc * hc * 8 + w16 * h16 * 8 + Hq * Wq * 4);
-  const work = 6 * W * H * 4 + 3 * hc * wc * 4 + Math.max(hc * wc * 16, W * H * 8) + 16 * 1048576 * 2 +
-               args.levelCacheMB * 1048576 + args.stackBudgetMB * 1048576 + 2 * W * H * 16;
-  return { frames, pre, work, total: frames + pre + work, perFrame: W * H * 4 + (wc * hc * 8 + w16 * h16 * 8 + Hq * Wq * 4) };
+  return {
+    frame: W * H * 4,                                          // RGBA8 フレーム 1 枚
+    persist: wc * hc * 8 + w16 * h16 * 8 + Hq * Wq * 4,        // 1/4, 1/16 レベル + 鮮明度（全フレームぶん常駐）
+    mask: Math.ceil(W * H / 32) * 4,                           // パックしたマスク（ストリーミング時のみ）
+    work: 6 * W * H * 4 + 3 * hc * wc * 4 + Math.max(hc * wc * 16, W * H * 8) + 16 * 1048576 * 2 +
+          args.levelCacheMB * 1048576 + args.stackBudgetMB * 1048576 + 2 * W * H * 16,
+    render: 512 * 1048576,                                     // キャンバス出力 4 面などの概算余裕
+  };
 }
-// フレーム数と解像度が確定した時点（抽出前）で上限と照合する
-function checkMemoryPlan(n, W, H, args) {
-  const est = estimateMemory(n, W, H, args);
+// フレーム数と解像度が確定した時点（デコード前）で上限と照合し、常駐 / ストリーミングを決める。
+// 戻り値 {maxResident}: 同時に GPU に置くフレーム数。足りない場合は args.levelCacheMB を下げる
+function planMemory(n, W, H, args) {
+  const est = estimateMemory(W, H, args);
   const lim = memLimitBytes();
-  log(`[memory] 推定 GPU バッファ ${fmtMB(est.total)}（フレーム ${fmtMB(est.frames)} + 前処理 ${fmtMB(est.pre)} + 作業領域 ${fmtMB(est.work)}、` +
-      `${fmtMB(est.perFrame)}/frame）、上限 ${lim > 0 ? fmtMB(lim) : "なし"}`);
-  if (lim > 0 && est.total > lim) {
-    const maxN = Math.max(0, Math.floor((lim - est.work) / est.perFrame));
-    if (maxN < 2) throw new Error(`メモリ上限を超えるため中止しました: ${n} frames ${W}x${H} で推定 ${fmtMB(est.total)} > 上限 ${fmtMB(lim)}。` +
-                                  `作業領域（level cache MB + stack budget MB + スクラッチ ${fmtMB(est.work)}）だけで上限に達します。上限（memory limit）を上げるか level cache MB を下げてください`);
-    throw new Error(`メモリ上限を超えるため中止しました: ${n} frames ${W}x${H} で推定 ${fmtMB(est.total)} > 上限 ${fmtMB(lim)}。\n` +
-                    `この解像度で収まるのは約 ${maxN} frames です。fps / max frames を下げる、Trim で範囲を絞る、input scale を下げる（0.5 で 1/4）、` +
-                    `または上限（memory limit）を上げてください（ブラウザがクラッシュしない範囲で）`);
+  const all = est.work + n * (est.frame + est.persist);
+  log(`[memory] 全フレーム常駐なら推定 ${fmtMB(all)}（フレーム ${fmtMB(n * est.frame)} + 前処理 ${fmtMB(n * est.persist)} + 作業領域 ${fmtMB(est.work)}）、` +
+      `上限 ${lim > 0 ? fmtMB(lim) : "なし"}`);
+  if (lim <= 0 || all + est.render <= lim) return { maxResident: n, streaming: false };
+  // ストリーミング: 常駐データ + 作業領域 + 合成余裕を引いた残りをフレームキャッシュに使う
+  const minFrames = 2 * (args.staticSpan ?? DEFAULTS.staticSpan) + 16;
+  const fixed = () => est.work + est.render + n * (est.persist + est.mask);
+  let avail = lim - fixed();
+  const lc = args.levelCacheMB ?? DEFAULTS.levelCacheMB;
+  if (avail < minFrames * est.frame && lc > 256) {
+    args.levelCacheMB = 256; est.work -= (lc - 256) * 1048576; avail = lim - fixed();
+    log(`[memory] level cache を ${lc}MB → 256MB に下げました`);
   }
-  return est;
+  if (avail < minFrames * est.frame) {
+    const maxN = Math.max(0, Math.floor((lim - est.work - est.render - minFrames * est.frame) / (est.persist + est.mask)));
+    throw new Error(`メモリ上限を超えるため中止しました: ${n} frames ${W}x${H} では常駐データ（${fmtMB(est.persist + est.mask)}/frame）と作業領域だけで上限 ${fmtMB(lim)} に達します。\n` +
+                    `この上限で扱えるのは約 ${maxN} frames です。fps / max frames を下げる、Trim で範囲を絞る、input scale を下げる（0.5 で 1/4）、または memory limit を上げてください`);
+  }
+  const maxResident = Math.min(n, Math.floor(avail / est.frame));
+  log(`[memory] ストリーミングモード: フレームキャッシュ ${maxResident} frames (${fmtMB(maxResident * est.frame)})、常駐データ ${fmtMB(n * (est.persist + est.mask))}。` +
+      `フレームは必要になるたびに読み直します（位置合わせと合成で複数回デコード）`);
+  return { maxResident, streaming: true };
 }
 
 function num(id, def) { const v = parseFloat($(id).value); return Number.isFinite(v) ? v : def; }
@@ -115,73 +131,6 @@ function readArgs() {
     anchorFrame: $("anchorFrame").value.trim() === "" ? -1 : int("anchorFrame", -1), anchorWindow: int("anchorWindow", 2),
     stackBudgetMB: int("stackBudget", 128), levelCacheMB: int("levelCache", 768),
   };
-}
-
-// ------------------------------------------------------------ フレーム読み込み
-function naturalKey(s) { return s.split(/(\d+)/).map((t) => (/^\d+$/.test(t) ? t.padStart(12, "0") : t.toLowerCase())).join(""); }
-
-function frameCanvas(w, h) {
-  const c = document.createElement("canvas");
-  c.width = w; c.height = h;
-  return c;
-}
-
-/** 動画からシークでフレーム抽出。各フレームは即 GPU バッファへ */
-async function loadVideoFrames(file, opts, onFrame) {
-  const url = URL.createObjectURL(file);
-  const v = document.createElement("video");
-  v.src = url; v.muted = true; v.preload = "auto"; v.playsInline = true;
-  await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = () => rej(new Error("動画を開けません（コーデック非対応の可能性）")); });
-  const dur = v.duration;
-  const crop = opts.crop || [0, 0, v.videoWidth, v.videoHeight];   // 元動画座標の切り出し矩形
-  const W = Math.max(8, Math.round(crop[2] * opts.inputScale)), H = Math.max(8, Math.round(crop[3] * opts.inputScale));
-  const cv = frameCanvas(W, H);
-  const ctx = cv.getContext("2d", { willReadFrequently: true });
-  let t0 = opts.start, t1 = Math.min(dur, opts.duration > 0 ? opts.start + opts.duration : dur);
-  if (opts.trim) { t0 = opts.trim.t0; t1 = Math.min(dur, opts.trim.t1); }
-  const step = 1.0 / opts.fps;
-  const times = [];
-  for (let t = t0; t < t1 - 1e-6; t += step) { times.push(t); if (opts.maxFrames > 0 && times.length >= opts.maxFrames) break; }
-  log(`[load] video ${v.videoWidth}x${v.videoHeight} ${dur.toFixed(2)}s, range ${t0.toFixed(3)}-${t1.toFixed(3)}s` +
-      (opts.trim ? ` (frames ${opts.trim.startFrame}-${opts.trim.endFrame} @ ${opts.trim.fps} fps)` : "") +
-      (opts.crop ? `, crop ${crop.join(",")}` : "") + ` → ${times.length} frames @ ${opts.fps} fps, scale ${opts.inputScale}`);
-  if (opts.onPlan) opts.onPlan(times.length, W, H);
-  const frames = [];
-  for (let k = 0; k < times.length; k++) {
-    await new Promise((res, rej) => {
-      const to = setTimeout(() => rej(new Error(`seek timeout at ${times[k].toFixed(2)}s`)), 15000);
-      v.onseeked = () => { clearTimeout(to); res(); };
-      v.onerror = () => { clearTimeout(to); rej(new Error("seek error")); };
-      v.currentTime = times[k];
-    });
-    ctx.drawImage(v, crop[0], crop[1], crop[2], crop[3], 0, 0, W, H);
-    const img = ctx.getImageData(0, 0, W, H);
-    frames.push(onFrame(k, img.data));
-    if (k % 10 === 0) setProgress("load", k / times.length);
-  }
-  URL.revokeObjectURL(url);
-  return { W, H, frames };
-}
-
-async function loadImageFrames(files, opts, onFrame) {
-  const list = [...files].sort((a, b) => (naturalKey(a.name) < naturalKey(b.name) ? -1 : 1));
-  const sel = list.filter((_, i) => i % opts.every === 0).slice(0, opts.maxFrames > 0 ? opts.maxFrames : undefined);
-  let W = 0, H = 0, cv = null, ctx = null;
-  const frames = [];
-  for (let k = 0; k < sel.length; k++) {
-    const bmp = await createImageBitmap(sel[k]);
-    if (k === 0) {
-      W = Math.max(8, Math.round(bmp.width * opts.inputScale)); H = Math.max(8, Math.round(bmp.height * opts.inputScale));
-      cv = frameCanvas(W, H); ctx = cv.getContext("2d", { willReadFrequently: true });
-      log(`[load] ${sel.length} images ${bmp.width}x${bmp.height} → ${W}x${H}`);
-      if (opts.onPlan) opts.onPlan(sel.length, W, H);
-    }
-    ctx.drawImage(bmp, 0, 0, W, H);
-    bmp.close();
-    frames.push(onFrame(k, ctx.getImageData(0, 0, W, H).data));
-    if (k % 10 === 0) setProgress("load", k / sel.length);
-  }
-  return { W, H, frames };
 }
 
 // ------------------------------------------------------------ 出力
@@ -245,7 +194,7 @@ async function run() {
   $("tabs").innerHTML = ""; $("view").innerHTML = "";
   for (const k of Object.keys(results)) delete results[k];
   const tAll = performance.now();
-  let runGpu = null;
+  let runGpu = null, src = null, store = null;
   try {
     const args = readArgs();
     runGpu = await ensureGpu();
@@ -253,20 +202,19 @@ async function run() {
     if (!files.length) throw new Error("動画ファイルまたはフレーム画像を選択（またはドロップ）してください");
     outPrefix = files[0].name.replace(/\.[^.]+$/, "") + "_";
     const opts = { fps: num("fps", 10), start: num("start", 0), duration: num("duration", 0), maxFrames: int("maxFrames", 0),
-                   inputScale: num("inputScale", 1.0), every: Math.max(1, int("every", 1)),
-                   onPlan: (n, W, H) => checkMemoryPlan(n, W, H, args) };
+                   inputScale: num("inputScale", 1.0), every: Math.max(1, int("every", 1)) };
     gpu.budgetBytes = memLimitBytes();
     gpu.peakBytes = gpu.allocBytes;
-    const onFrame = (k, rgba) => { const b = gpu.buf(rgba.byteLength, `frame${k}`); gpu.upload(b, rgba); return b; };
     const isVideo = files.length === 1 && isVideoFile(files[0]);
     if (isVideo) {
       const st = trim.getState();
       if (st.active && st.fps > 0) { opts.trim = st; opts.crop = st.crop; }
     }
-    const src = isVideo ? await loadVideoFrames(files[0], opts, onFrame) : await loadImageFrames(files, opts, onFrame);
-    if (src.frames.length < 2) throw new Error("フレームが 2 枚未満です");
-    log(`[load] ${src.frames.length} frames, GPU frame memory ${(src.frames.length * src.W * src.H * 4 / 1048576).toFixed(0)}MB`);
-    rc = new Reconstructor(gpu, src.W, src.H, src.frames, args, log, setProgress);
+    src = isVideo ? await openVideoSource(files[0], opts, log) : await openImageSource(files, opts, log);
+    if (src.n < 2) throw new Error("フレームが 2 枚未満です");
+    const plan = planMemory(src.n, src.W, src.H, args);
+    store = new FrameStore(gpu, src, { maxResident: plan.maxResident, log });
+    rc = new Reconstructor(gpu, src.W, src.H, store, args, log, setProgress);
     await rc.preprocess();
     await makeOverlayDebug(rc);
     const al = await rc.align();
@@ -306,6 +254,7 @@ async function run() {
       showImage("coverage", cov, res.Wc, res.Hc, "coverage");
       showImage("recon_median", res.median, res.Wc, res.Hc, "median");
     }
+    log(`[frames] ${store.stats()}`);
     log(`[done] total ${((performance.now() - tAll) / 1000).toFixed(1)}s, GPU buffer peak ${fmtMB(gpu.peakBytes)}`);
   } catch (e) {
     const lost = runGpu && runGpu.lostInfo && runGpu.lostInfo.reason !== "destroyed" ? runGpu.lostMessage() : null;
@@ -315,9 +264,12 @@ async function run() {
   } finally {
     if (rc) {
       try { if (gpu) await gpu.done(); } catch (e) { /* ignore */ }
-      if (window.__keepRc) window.__rc = rc; else rc.destroy();   // __keepRc: デバッグ用に GPU 資源を保持
+      if (window.__keepRc) window.__rc = rc; else rc.destroy();   // __keepRc: デバッグ用に GPU 資源を保持（フレームキャッシュ含む）
       rc = null;
+    } else if (store) {
+      store.destroy();
     }
+    if (src) src.close();
     running = false;
     $("run").disabled = !!gpuError; $("cancel").disabled = true; $("probe").disabled = !!gpuError;
     setProgress("idle", 0);
@@ -378,7 +330,6 @@ async function probeMemory() {
 }
 $("probe").onclick = probeMemory;
 $("cancel").onclick = () => { if (rc) rc.abort = true; };
-const isVideoFile = (f) => f.type.startsWith("video/") || /\.(mp4|webm|mov|m4v|mkv)$/i.test(f.name);
 // Trim / Crop パネル: 無視/テキスト矩形はクロップ後座標でパラメータ欄に書き戻す。実測 fps は fps 欄の既定値にする
 const trim = new TrimPanel($("trim"), {
   onRects: (ig, tx) => {

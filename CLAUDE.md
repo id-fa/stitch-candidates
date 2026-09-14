@@ -243,7 +243,8 @@ cd web && python -m http.server 8765   # ES モジュールのため file:// で
   バッチごと 1 回）。MAD はヒストグラム近似
 - 結果は Python 版とほぼ一致（sample.mp4: 残差中央値 0.02 px、スケール 1.0000-1.0008。sample3_zoom.mp4: 最大スケール
   1.9205 対 1.9206）。RTX 3080 Ti で sample.mp4 136 フレームが 30 s（Python + CUDA は 53 s）
-- 全フレームを RGBA8 で GPU 常駐（1080p で 8 MB / フレーム）。足りなければ UI の `input scale` / `fps` / `max frames` で削減
+- フレームは RGBA8 で GPU に置く（1080p で 8 MB / フレーム）。memory limit に収まれば全フレーム常駐、超えるならストリーミング
+  （`frames.js` の `FrameStore` が LRU で必要なフレームだけ常駐させ、動画から読み直す。2026-09-14 追加）。結果は常駐時と同一
 - 動画はブラウザの `<video>` シークで抽出するため、フレーム集合が Python 版と 1 フレームずれることがある
 - テロップ対策（2026-09-13 追加、Python 版にも同じオプションあり）: `text rects`（動くティッカー帯を勾配でマスク）、`halo`（静止エッジ周辺の
   静止画素＝文字のグローもマスク）、`close`（前後フレームでマスクされていれば埋める＝光沢アニメ対策）、`hole fill`
@@ -262,8 +263,16 @@ cd web && python -m http.server 8765   # ES モジュールのため file:// で
   512MB ずつ実確保して検証できる（失敗時は確保量の 80% に下げて保存）。Dawn 内部の確保で D3D12 が OOM を返すとデバイス喪失になる
   （オンボード GPU の共有メモリ予算はメインメモリよりずっと小さい。目安 4〜6 GB）。喪失は `Gpu.lostInfo` に記録し、`checkOom` と
   `run()` の catch で「GPU メモリ不足でデバイスが失われました」に差し替え、次の `ensureGpu()` で作り直す
-- ファイル: `index.html` (UI), `app.js` (入出力), `trim.js` (トリム/クロップ), `gpu.js` (基盤), `shaders_img.js` / `shaders_align.js` /
-  `shaders_render.js` (WGSL), `recon.js` (位置合わせ), `render.js` (合成), `postfx.js` (穴埋め), `solve.js` (CPU 最小二乗)
+- ストリーミング（2026-09-14 追加）: `app.js` の `planMemory` が常駐 / ストリーミングを決め、`FrameStore` の常駐上限を渡す。
+  `recon.js` の前処理はフレーム順パイプライン（stage1 静止検出 → closeK → finalizeK。複数フレームを集めてカーネルを積む間は pin）、
+  マスクは `packMask` で 1 bit/画素に保持し再読込時に `unpack_mask` で alpha へ復元。精密ペアは `_inFrameOrder` で (i, j) 順、
+  `freeCoarse` で C4/C16 とレベルキャッシュを解放。`render.js` は行帯 / 列帯（`horiz` = キャンバスが横に伸びているか）で
+  タイル化し、キャッシュが帯の被覆数より少なければ等間隔に間引く（`stride`）。旧版と出力がバイト一致することを確認済み。
+  注意: FrameStore の破棄は `gpu.submit()` 後に行う（未送信コマンドの参照を壊さない）。複数フレームを `get()` で集めてから
+  カーネルを積む箇所は必ず pin する（集めている間の破棄でバッファが無効になる）
+- ファイル: `index.html` (UI), `app.js` (入出力), `frames.js` (フレーム供給 / GPU キャッシュ), `trim.js` (トリム/クロップ), `gpu.js` (基盤),
+  `shaders_img.js` / `shaders_align.js` / `shaders_render.js` (WGSL), `recon.js` (位置合わせ), `render.js` (合成), `postfx.js` (穴埋め),
+  `solve.js` (CPU 最小二乗)
 
 ---
 

@@ -1,6 +1,12 @@
 // render.js - 整列済みフレームの合成（時間方向中央値 / インライア平均 / 鮮明度上位平均 / 被覆）
+//
+// キャンバスを帯（動きが縦ならフル幅の行帯、横ならフル高さの列帯）に分け、帯ごとに、それを覆うフレームだけを
+// 順に投影してサンプルスタックを作り、画素ごとの統計を取る。フレームは FrameStore から 1 枚ずつ取得するので
+// 同時に常駐させる必要はなく、ストリーミング時は帯の順に動画から読み直される（隣り合う帯はほぼ同じフレーム集合を
+// 使うので、キャッシュが「1 帯を覆うフレーム数」以上あれば各フレームの読み直しは 1 回で済む）。
 
 import { RENDER } from "./shaders_render.js";
+import { fmtMB } from "./gpu.js";
 
 const now = () => performance.now() / 1000;
 
@@ -15,7 +21,7 @@ function corners(S, TH, T, k, H, W) {
  * 戻り値 {Wc, Hc, median, mean, sharp: Uint8ClampedArray(RGBA), coverage: Uint32Array}
  */
 export async function render(rc, al) {
-  const a = rc.a, g = rc.gpu, H = rc.H, W = rc.W, n = rc.n;
+  const a = rc.a, g = rc.gpu, H = rc.H, W = rc.W, n = rc.n, st = rc.store;
   const K = {};
   for (const [name, def] of Object.entries(RENDER)) K[name] = g.kernel(name, def.code, def.fields, def.bindings, def.wg);
   const S = Float64Array.from(al.S), TH = Float64Array.from(al.TH), T = Float64Array.from(al.T);
@@ -37,34 +43,93 @@ export async function render(rc, al) {
   const outBytes = Wc * Hc * 4;
   const lim = g.device.limits.maxStorageBufferBindingSize;
   if (outBytes > lim) throw new Error(`キャンバス ${Wc}x${Hc} が大きすぎます（${(outBytes / 1048576).toFixed(0)}MB > ${(lim / 1048576).toFixed(0)}MB）。canvas scale を下げてください`);
-  // 帯域高さ: サンプルスタック (n × bh × Wc × 8B) が予算に収まるように
-  const budget = Math.min(a.stackBudgetMB * 1048576, lim);
-  const bh = Math.max(4, Math.min(a.band, Math.floor(budget / (n * Wc * 8))));
   // 拡大率レベル: 1/12 オクターブ刻み（レベル 0 = 拡大率 1/4）。res_lv は許容する差（255 = 無効）
   const magLevel = (s) => Math.max(0, Math.min(63, Math.round((Math.log2(s) + 2) * 12)));
   const resLv = a.resTol > 0 ? Math.round(Math.log2(a.resTol) * 12) : 255;
   const anchor = Number.isFinite(a.anchorFrame) && a.anchorFrame >= 0 ? [Math.max(0, a.anchorFrame - a.anchorWindow), Math.min(n - 1, a.anchorFrame + a.anchorWindow)] : null;
-  rc.log(`[render] canvas ${Wc}x${Hc}, canvas scale=${gsc.toFixed(4)}, band=${bh}, res tol=${a.resTol}` + (anchor ? `, anchor frames ${anchor[0]}-${anchor[1]}` : ""));
-  g.reserve(n * bh * Wc * 8 + outBytes * 4 + W * H * 16 * 2, `render (canvas ${Wc}x${Hc})`);
+  const inAnchor = (k) => anchor !== null && k >= anchor[0] && k <= anchor[1];
+
+  // 帯の向き: キャンバスがフレームより横に伸びていれば列帯、そうでなければ行帯
+  const horiz = (Wc - W) > (Hc - H);
+  const L = horiz ? Hc : Wc;        // 帯の長辺
+  const span = horiz ? Wc : Hc;     // 帯を並べる方向の長さ
+  const lo = (k) => (horiz ? boxes[k].x0 : boxes[k].y0), hi = (k) => (horiz ? boxes[k].x1 : boxes[k].y1);
+  // 1 画素幅の線を覆うフレーム数の最大（区間の重なりの最大値）
+  const ev = [];
+  for (let k = 0; k < n; k++) ev.push([lo(k), 1], [hi(k), -1]);
+  ev.sort((p, q) => p[0] - q[0] || p[1] - q[1]);
+  let cur = 0, maxCover = 0;
+  for (const [, d] of ev) { cur += d; maxCover = Math.max(maxCover, cur); }
+  // 帯幅: スタック (K × bw × L × 8B) が予算に収まるように。K は帯を覆うフレーム数の最大
+  const budget = Math.min(a.stackBudgetMB * 1048576, lim);
+  const tilesFor = (bw, use) => {
+    const tiles = [];
+    for (let t0 = 0; t0 < span; t0 += bw) {
+      const t1 = Math.min(span, t0 + bw);
+      const ks = [];
+      for (let k = 0; k < n; k++) if (use(k) && lo(k) < t1 && hi(k) > t0) ks.push(k);
+      tiles.push({ t0, t1, ks });
+    }
+    return tiles;
+  };
+  const pick = (use) => {
+    let bw = Math.max(4, a.band | 0);
+    let tiles = tilesFor(bw, use);
+    let Kmax = Math.max(1, ...tiles.map((t) => t.ks.length));
+    if (Kmax * bw * L * 8 > budget) {
+      bw = Math.max(4, Math.floor(budget / (Kmax * L * 8)));
+      tiles = tilesFor(bw, use);
+      Kmax = Math.max(1, ...tiles.map((t) => t.ks.length));
+    }
+    return { bw, tiles, Kmax };
+  };
+  let sel = pick(() => true);
+  const needOf = (s) => s.Kmax * s.bw * L * 8 + outBytes * 4 + W * H * 16 * 2;
+  // フレームキャッシュ: 合成で必要なバッファ（スタック、出力 4 面、ぼかし作業）を引いた残りに合わせる
+  let cacheFrames = st.maxResident;
+  if (g.budgetBytes > 0) {
+    const avail = Math.floor((g.budgetBytes - (g.allocBytes - st.residentBytes) - needOf(sel)) / st.frameBytes);
+    if (avail < 2) throw new Error(`合成に必要なメモリ（${fmtMB(needOf(sel))}）を確保できません。memory limit を上げるか stack budget / canvas scale を下げてください`);
+    cacheFrames = Math.min(cacheFrames, avail);
+  }
+  // ストリーミングでキャッシュが帯の被覆数より小さいと帯ごとに全フレームを読み直すことになるので、フレームを等間隔に間引く
+  let stride = 1;
+  if (cacheFrames < n) {
+    const cap = Math.max(4, cacheFrames - 4);
+    if (maxCover > cap) stride = Math.ceil(maxCover / cap);
+  }
+  if (stride > 1) {
+    sel = pick((k) => k % stride === 0 || k === n - 1 || inAnchor(k));   // 端のフレームはキャンバス端の被覆に必要
+    rc.log(`  警告: フレームキャッシュ（${cacheFrames} 枚）が帯を覆うフレーム数（最大 ${maxCover}）より少ないため、合成には ${stride} フレームごとに 1 枚を使います` +
+           `（標本数 1/${stride}）。memory limit を上げるか fps を下げると回避できます`);
+  }
+  if (cacheFrames < st.maxResident) { st.setMaxResident(cacheFrames); rc.log(`[render] フレームキャッシュを ${cacheFrames} 枚に縮小`); }
+  const { bw, tiles, Kmax } = sel;
+  rc.log(`[render] canvas ${Wc}x${Hc}, canvas scale=${gsc.toFixed(4)}, ${horiz ? "column" : "row"} bands of ${bw}px (${tiles.length}), ` +
+         `max ${Kmax} frames/band, res tol=${a.resTol}` + (anchor ? `, anchor frames ${anchor[0]}-${anchor[1]}` : ""));
+  const need = needOf(sel);
+  g.reserve(need, `render (canvas ${Wc}x${Hc})`);
   const t0 = now();
-  const stack = g.buf(n * bh * Wc * 8, "stack");
+  const stack = g.buf(Kmax * bw * L * 8, "stack");
   const outMed = g.buf(outBytes, "out_med"), outMean = g.buf(outBytes, "out_mean"), outSharp = g.buf(outBytes, "out_sharp"), outCov = g.buf(outBytes, "out_cov");
   const tmp1 = g.buf(W * H * 16, "blur_tmp1"), tmp2 = g.buf(W * H * 16, "blur_tmp2");
-  let nb = 0, nbTotal = Math.ceil(Hc / bh);
-  for (let y0 = 0; y0 < Hc; y0 += bh) {
-    const y1 = Math.min(Hc, y0 + bh);
-    const ks = [];
-    for (let k = 0; k < n; k++) if (boxes[k].y0 < y1 && boxes[k].y1 > y0) ks.push(k);
+  let nb = 0;
+  for (const tile of tiles) {
+    const x0 = horiz ? tile.t0 : 0, y0 = horiz ? 0 : tile.t0;
+    const tw = horiz ? tile.t1 - tile.t0 : Wc, th = horiz ? Hc : tile.t1 - tile.t0;
+    const ks = tile.ks;
     if (ks.length) {
-      ks.forEach((k, slot) => {
+      for (let slot = 0; slot < ks.length; slot++) {
+        const k = ks[slot];
+        const fr = await st.get(k);
         const s = S[k], c = Math.cos(TH[k]), sn = Math.sin(TH[k]), Tx = T[k * 2], Ty = T[k * 2 + 1];
         let useBlur = 0;
         if (s < 0.9) {
           const sigma = 0.5 * Math.sqrt(1.0 / (s * s) - 1.0);
           const r = Math.min(12, Math.max(1, Math.ceil(3 * sigma)));
-          // 帯域が参照するフレーム行の範囲
+          // タイルが参照するフレーム行の範囲
           let fy0 = Infinity, fy1 = -Infinity;
-          for (const [X, Y] of [[0, y0], [Wc, y0], [0, y1], [Wc, y1]]) {
+          for (const [X, Y] of [[x0, y0], [x0 + tw, y0], [x0, y0 + th], [x0 + tw, y0 + th]]) {
             const u = (X - Tx) / s, v = (Y - Ty) / s;
             const fy = -sn * u + c * v;
             fy0 = Math.min(fy0, fy); fy1 = Math.max(fy1, fy);
@@ -72,25 +137,25 @@ export async function render(rc, al) {
           const r0 = Math.max(0, Math.floor(fy0) - 1), r1 = Math.min(H, Math.ceil(fy1) + 2);
           if (r1 > r0) {
             const e0 = Math.max(0, r0 - r), e1 = Math.min(H, r1 + r);
-            K.gauss_rgba.run2d({ W, H, sigma, axis: 0, row0: e0, row1: e1 }, [rc.frames[k], tmp1, tmp1], W, e1 - e0);
-            K.gauss_rgba.run2d({ W, H, sigma, axis: 1, row0: r0, row1: r1 }, [rc.frames[k], tmp1, tmp2], W, r1 - r0);
+            K.gauss_rgba.run2d({ W, H, sigma, axis: 0, row0: e0, row1: e1 }, [fr, tmp1, tmp1], W, e1 - e0);
+            K.gauss_rgba.run2d({ W, H, sigma, axis: 1, row0: r0, row1: r1 }, [fr, tmp1, tmp2], W, r1 - r0);
             useBlur = 1;
           }
         }
-        K.warp.run2d({ Wc, y0, bh, W, H, Wq: rc.Wq, Hq: rc.Hq, slot, sharp_off: k * rc.Hq * rc.Wq, use_blur: useBlur, s, c, sn, Tx, Ty, mag_lv: magLevel(s) },
-          [rc.frames[k], tmp2, rc.sharpq, stack], Wc, y1 - y0);
-      });
+        K.warp.run2d({ x0, y0, tw, th, W, H, Wq: rc.Wq, Hq: rc.Hq, slot, sharp_off: k * rc.Hq * rc.Wq, use_blur: useBlur, s, c, sn, Tx, Ty, mag_lv: magLevel(s) },
+          [fr, tmp2, rc.sharpq, stack], tw, th);
+      }
       // アンカーフレームのスロット範囲（ks は昇順なので連続）。無ければ lo > hi
       let ancLo = 1, ancHi = 0;
       if (anchor) {
-        const idx = ks.map((k, i) => (k >= anchor[0] && k <= anchor[1] ? i : -1)).filter((i) => i >= 0);
+        const idx = ks.map((k, i) => (inAnchor(k) ? i : -1)).filter((i) => i >= 0);
         if (idx.length) { ancLo = idx[0]; ancHi = idx[idx.length - 1]; }
       }
-      K.median.run2d({ Wc, bh, K: ks.length, y0, tol: a.inlierTol * 255.0, sharp_top: a.sharpTop, res_lv: resLv, anc_lo: ancLo, anc_hi: ancHi },
-        [stack, outMed, outMean, outSharp, outCov], Wc, y1 - y0);
+      K.median.run2d({ Wc, x0, y0, tw, th, K: ks.length, tol: a.inlierTol * 255.0, sharp_top: a.sharpTop, res_lv: resLv, anc_lo: ancLo, anc_hi: ancHi },
+        [stack, outMed, outMean, outSharp, outCov], tw, th);
     }
     nb++;
-    if (nb % 4 === 0) { await g.done(); rc.progress("render", nb / nbTotal); }
+    if (nb % 4 === 0) { await g.done(); rc.progress("render", nb / tiles.length); rc._check(); }
   }
   const med = new Uint8ClampedArray(await g.read(outMed, outBytes));
   const mn = new Uint8ClampedArray(await g.read(outMean, outBytes));
@@ -103,7 +168,8 @@ export async function render(rc, al) {
     if (covG[i] === 0) holes++; else if (cov[i] === 0) fallback++;
   }
   for (const b of [stack, outMed, outMean, outSharp, outCov, tmp1, tmp2]) g.free(b);
-  rc.log(`[render] done ${(now() - t0).toFixed(1)}s, uncovered px=${holes}, fallback (no clean sample) px=${fallback}`);
+  rc.log(`[render] done ${(now() - t0).toFixed(1)}s, uncovered px=${holes}, fallback (no clean sample) px=${fallback}` +
+         (st.allResident ? "" : ` (streaming, ${st.stats()})`));
   rc.progress("render", 1);
   return { Wc, Hc, median: med, mean: mn, sharp: sh, coverage: cov, coverageGeom: covG, canvasScale: gsc };
 }

@@ -1,6 +1,6 @@
 // shaders_render.js - 合成カーネル
 // - gauss_rgba: フレームの行範囲だけをガウスぼかし（縮小時のプリフィルタ）
-// - warp: フレームをキャンバス帯域に相似変換で投影し、サンプルスタックに書く
+// - warp: フレームをキャンバスのタイル（行帯または列帯）に相似変換で投影し、サンプルスタックに書く
 //     word0 = r | g<<8 | b<<16 | flags<<24 (bit0: 幾何的有効, bit1: クリーン), word1 = 鮮明度 f32 のビット
 // - median: ピクセルごとに時間方向中央値 / インライア平均 / 鮮明度上位平均 / 被覆数
 
@@ -37,12 +37,12 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 };
 
 RENDER.warp = {
-  fields: [["Wc", "u32"], ["y0", "u32"], ["bh", "u32"], ["W", "u32"], ["H", "u32"], ["Wq", "u32"], ["Hq", "u32"],
+  fields: [["x0", "u32"], ["y0", "u32"], ["tw", "u32"], ["th", "u32"], ["W", "u32"], ["H", "u32"], ["Wq", "u32"], ["Hq", "u32"],
            ["slot", "u32"], ["sharp_off", "u32"], ["use_blur", "u32"],
            ["s", "f32"], ["c", "f32"], ["sn", "f32"], ["Tx", "f32"], ["Ty", "f32"], ["mag_lv", "u32"]],
   bindings: ["r", "r", "r", "rw"], wg: [16, 16, 1],
   code: /* wgsl */ `
-struct P { Wc: u32, y0: u32, bh: u32, W: u32, H: u32, Wq: u32, Hq: u32, slot: u32, sharp_off: u32, use_blur: u32,
+struct P { x0: u32, y0: u32, tw: u32, th: u32, W: u32, H: u32, Wq: u32, Hq: u32, slot: u32, sharp_off: u32, use_blur: u32,
            s: f32, c: f32, sn: f32, Tx: f32, Ty: f32, mag_lv: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> frame: array<u32>;
@@ -55,9 +55,9 @@ fn rgba_of(c: u32) -> vec4<f32> {
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let x = g.x; let yy = g.y;
-  if (x >= p.Wc || yy >= p.bh) { return; }
-  let o = ((p.slot * p.bh + yy) * p.Wc + x) * 2u;
-  let X = f32(x); let Y = f32(p.y0 + yy);
+  if (x >= p.tw || yy >= p.th) { return; }
+  let o = ((p.slot * p.th + yy) * p.tw + x) * 2u;
+  let X = f32(p.x0 + x); let Y = f32(p.y0 + yy);
   let u = (X - p.Tx) / p.s; let v = (Y - p.Ty) / p.s;
   let fx = p.c * u + p.sn * v; let fy = -p.sn * u + p.c * v;
   let W = i32(p.W); let H = i32(p.H);
@@ -97,11 +97,11 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 
 // 時間方向の統計。基数選択（ニブル単位）で中央値と分位点を求める
 RENDER.median = {
-  fields: [["Wc", "u32"], ["bh", "u32"], ["K", "u32"], ["y0", "u32"], ["tol", "f32"], ["sharp_top", "f32"], ["res_lv", "u32"],
-           ["anc_lo", "u32"], ["anc_hi", "u32"]],
+  fields: [["Wc", "u32"], ["x0", "u32"], ["y0", "u32"], ["tw", "u32"], ["th", "u32"], ["K", "u32"], ["tol", "f32"], ["sharp_top", "f32"],
+           ["res_lv", "u32"], ["anc_lo", "u32"], ["anc_hi", "u32"]],
   bindings: ["r", "rw", "rw", "rw", "rw"], wg: [16, 16, 1],
   code: /* wgsl */ `
-struct P { Wc: u32, bh: u32, K: u32, y0: u32, tol: f32, sharp_top: f32, res_lv: u32, anc_lo: u32, anc_hi: u32 }
+struct P { Wc: u32, x0: u32, y0: u32, tw: u32, th: u32, K: u32, tol: f32, sharp_top: f32, res_lv: u32, anc_lo: u32, anc_hi: u32 }
 // res_lv: 許容する拡大率レベル差（255 = 無効）。anc_lo..anc_hi: アンカーフレームのスロット範囲（anc_lo > anc_hi なら無効）
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> stack: array<u32>;
@@ -170,10 +170,10 @@ fn pack(c: vec3<f32>) -> u32 {
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let x = g.x; let yy = g.y;
-  if (x >= p.Wc || yy >= p.bh) { return; }
-  let base = (yy * p.Wc + x) * 2u;
-  let stride = p.bh * p.Wc * 2u;
-  let oi = (p.y0 + yy) * p.Wc + x;
+  if (x >= p.tw || yy >= p.th) { return; }
+  let base = (yy * p.tw + x) * 2u;
+  let stride = p.th * p.tw * 2u;
+  let oi = (p.y0 + yy) * p.Wc + p.x0 + x;
   let zero = vec3<f32>(0.0);
   let cnt_c = count_mode(base, stride, 0u, zero, 255u, 0u);   // 被覆数（穴埋め判定用）はフィルタ前
   let cnt_g = count_mode(base, stride, 1u, zero, 255u, 0u);

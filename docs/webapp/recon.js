@@ -17,13 +17,13 @@ const now = () => performance.now() / 1000;
 const MODEL_ID = { translation: 0, scale: 1, similarity: 2 };
 
 export class Reconstructor {
-  /** frames: フレームごとの RGBA8 GPUBuffer（W*H*4 バイト） */
-  constructor(gpu, W, H, frames, args, log, progress) {
-    const n = frames.length;
+  /** store: FrameStore（フレームの RGBA8 GPUBuffer を供給。ストリーミング時は必要なフレームだけを常駐させる） */
+  constructor(gpu, W, H, store, args, log, progress) {
+    const n = store.n;
     this.gpu = gpu; this.W = W; this.H = H; this.n = n;
     this.a = { ...DEFAULTS, ...args };
     this.log = log; this.progress = progress || (() => {});
-    this.frames = frames;
+    this.store = store;
     this.abort = false;
     this._dbgFail = 0;
     const cs = this.a.coarseScale;
@@ -59,7 +59,7 @@ export class Reconstructor {
 
   // ------------------------------------------------------------ 前処理
   async preprocess() {
-    const a = this.a, g = this.gpu, K = this.k, W = this.W, H = this.H, n = this.n;
+    const a = this.a, g = this.gpu, K = this.k, W = this.W, H = this.H, n = this.n, st = this.store;
     const t0 = now();
     const [fA, fB, fC, fD, fE, fF] = this.f;
     const [cA, cB, cC] = this.c;
@@ -73,20 +73,31 @@ export class Reconstructor {
     const trects = new Array(32).fill(0);
     const ntext = Math.min(8, a.textRects.length);
     for (let i = 0; i < ntext; i++) for (let c = 0; c < 4; c++) trects[i * 4 + c] = a.textRects[i][c];
-    for (let k = 0; k < n; k++) {
-      const fr = this.frames[k];
-      // 静止オーバーレイ（+ テキスト矩形内の勾配ベース文字マスク）
-      //   fA: 静止エッジ, fD: flat（静止 / 矩形内）→ 密度 (5x5) > 0.3 を二値化 → 膨張 r（fC）と膨張 rh（fE）
+    const doMask = (a.staticMask && n > 1) || ntext > 0;
+    const nclose = doMask ? Math.max(0, Math.min(3, a.staticClose | 0)) : 0;
+    const packMasks = !st.allResident;   // 破棄したフレームを読み直す時にマスク（alpha）を復元するため
+    // フレームは k の順に処理する。フレーム k の処理に必要なのは k±span（静止検出）と k±nclose（クロージング）だけなので、
+    // ストリーミング時も窓のぶんだけ常駐していれば足りる。複数フレームを集めてからカーネルを積む箇所は、
+    // 集めている間に破棄されないよう pin する
+
+    // 段階 1: 静止オーバーレイ（+ テキスト矩形内の勾配ベース文字マスク）→ フレーム k の alpha に書く
+    //   fA: 静止エッジ, fD: flat（静止 / 矩形内）→ 密度 (5x5) > 0.3 を二値化 → 膨張 r（fC）と膨張 rh（fE）
+    const stage1 = async (k) => {
+      const fr = await st.get(k);
+      st.pin(k);                     // マスク確定（段階 3）まで破棄させない
       let useDens = 0;
-      if ((a.staticMask && n > 1) || ntext > 0) {
+      if (doMask) {
         // 比較相手: k±span のうち範囲内のもの（いずれかと一致すれば静止）
         let cands = [k - span, k + span].filter((j) => j >= 0 && j < n && j !== k);
         if (!cands.length) cands = [Math.max(0, Math.min(n - 1, k + (k === 0 ? span : -span)))];
         cands = cands.slice(0, 4);
         const diff = a.staticMask && n > 1 ? a.staticDiff : -1.0;   // 静止検出を無効化する場合は diff を負にする
-        const cf = [0, 1, 2, 3].map((q) => this.frames[cands[Math.min(q, cands.length - 1)]]);
+        const cf = [], newly = [];   // 新たに pin したものだけ後で外す（段階 3 待ちで pin 中のフレームと重なることがある）
+        for (const j of cands) { cf.push(await st.get(j)); if (!st.pinned.has(j)) { st.pin(j); newly.push(j); } }
+        const cf4 = [0, 1, 2, 3].map((q) => cf[Math.min(q, cf.length - 1)]);
         K.static_detect.run2d({ W, H, diff, grad: a.staticGrad, ncand: cands.length, ntext, trects },
-          [fr, cf[0], cf[1], cf[2], cf[3], fA, fD], W, H);
+          [fr, cf4[0], cf4[1], cf4[2], cf4[3], fA, fD], W, H);
+        for (const j of newly) st.unpin(j);
         K.box_blur.run2d({ W, H, r: 2, axis: 0, sub: 0 }, [fA, fA, fB], W, H);
         K.box_blur.run2d({ W, H, r: 2, axis: 1, sub: 0 }, [fB, fA, fC], W, H);
         K.threshold.run({ n: W * H, thr: 0.3 }, [fC, fA], Math.ceil(W * H / 256));
@@ -101,25 +112,28 @@ export class Reconstructor {
         useDens = 1;
       }
       K.finalize_mask.run2d({ W, H, use_dens: useDens, nrect, rects }, [fC, fE, fF, fD, fr], W, H);
-      g.submit();
-      if (k % 8 === 7) { await g.done(); this.progress("preprocess", 0.5 * (k + 1) / n); this._check(); }
-    }
-    // マスクの時間方向クロージング（j=1..staticClose の前後両方でマスクされていれば埋める）
-    const nclose = Math.max(0, Math.min(3, a.staticClose | 0));
-    if (nclose > 0 && (a.staticMask || ntext > 0)) {
-      for (let k = 0; k < n; k++) {
-        const pairs = [];
-        for (let j = 1; j <= nclose; j++) if (k - j >= 0 && k + j < n) pairs.push([this.frames[k - j], this.frames[k + j]]);
-        if (!pairs.length) continue;
-        const bufs = [this.frames[k]];
+    };
+    // 段階 2: マスクの時間方向クロージング（j=1..nclose の前後両方でマスクされていれば埋める）。
+    //   k-j は確定済み（読み直しても pack 済みマスクが復元される）、k+j は段階 1 済みで pin 中
+    const closeK = async (k) => {
+      const pairs = [], held = [];
+      for (let j = 1; j <= nclose; j++) {
+        if (k - j < 0 || k + j >= n) continue;
+        const pa = await st.get(k - j);
+        if (!st.pinned.has(k - j)) { st.pin(k - j); held.push(k - j); }
+        const pb = await st.get(k + j);
+        pairs.push([pa, pb]);
+      }
+      if (pairs.length) {
+        const bufs = [st.peek(k)];
         for (let q = 0; q < 3; q++) { const pr = pairs[Math.min(q, pairs.length - 1)]; bufs.push(pr[0], pr[1]); }
         K.mask_close.run({ n: W * H, npair: pairs.length }, bufs, Math.ceil(W * H / 256));
       }
-      g.submit();
-    }
-    for (let k = 0; k < n; k++) {
-      const fr = this.frames[k];
-      // グレー、鮮明度
+      for (const j of held) st.unpin(j);
+    };
+    // 段階 3: グレー / 鮮明度 / 1/4, 1/16 レベル（マスク確定後）。ストリーミング時はマスクをパックしてから固定解除
+    const finalizeK = (k) => {
+      const fr = st.peek(k);
       K.gray_area.run2d({ W, H, w: W, h: H }, [fr, fA], W, H);
       K.laplacian_abs.run2d({ W, H }, [fA, fB], W, H);
       K.box_blur.run2d({ W, H, r: 7, axis: 0, sub: 0 }, [fB, fB, fC], W, H);
@@ -141,14 +155,23 @@ export class Reconstructor {
       K.area_f32.run2d({ W, H, w: this.w16, h: this.h16, src_off: 0, dst_off: 0 }, [fB, sB], this.w16, this.h16);
       this.C16[k] = g.buf(this.w16 * this.h16 * 8, `C16_${k}`);
       K.pack2.run({ n: this.w16 * this.h16 }, [sC, sB, this.C16[k]], Math.ceil(this.w16 * this.h16 / 256));
+      if (packMasks) st.packMask(k);
+      st.unpin(k);
+    };
+    // 段階 1 を k の順に進め、nclose 遅れで段階 2 → 3 を行う（k-j は確定済み、k+j は段階 1 済み）
+    const lag = nclose;
+    for (let k = 0; k < n + lag; k++) {
+      if (k < n) await stage1(k);
+      const kk = k - lag;
+      if (kk >= 0) { if (nclose > 0) await closeK(kk); finalizeK(kk); }
       g.submit();
-      if (k % 8 === 7) { await g.done(); this.progress("preprocess", 0.5 + 0.5 * (k + 1) / n); this._check(); }
+      if (k % 8 === 7 || k === n + lag - 1) { await g.done(); this.progress("preprocess", (k + 1) / (n + lag)); this._check(); }
     }
     const rat = new Float32Array(await g.read(this.ratioBuf, n * 4));
     for (let k = 0; k < n; k++) this.overlayRatio[k] = 1.0 - rat[k] / (this.wc * this.hc);
     const mr = mean(this.overlayRatio);
     this.log(`[preprocess] ${n} frames ${W}x${H}, coarse ${this.wc}x${this.hc} / ${this.w16}x${this.h16}, ` +
-             `overlay mask mean ratio=${mr.toFixed(3)}, ${(now() - t0).toFixed(1)}s`);
+             `overlay mask mean ratio=${mr.toFixed(3)}, ${(now() - t0).toFixed(1)}s` + (st.allResident ? "" : ` (streaming, ${st.stats()})`));
     if (mr > 0.5) this.log("  警告: オーバーレイマスクが 50% を超えています。static-span を大きくするか static-diff を小さくしてください");
     this.progress("preprocess", 1);
   }
@@ -163,17 +186,18 @@ export class Reconstructor {
     return { lvs: [...s].sort((x, y) => x - y), sigma: 1.0 };
   }
 
-  _levels(k) {
+  async _levels(k) {
     const e = this.levelCache.get(k);
     if (e) { this.levelCache.delete(k); this.levelCache.set(k, e); return e.levels; }
     const K = this.k, g = this.gpu, W = this.W, H = this.H;
     const [fA, fB, fC, fD, fE, fF] = this.f;
     const { lvs, sigma } = this._levelSpec();
     const rF = (odd(Math.max(3, 0.08 * Math.min(H, W))) - 1) / 2;
-    K.gray_area.run2d({ W, H, w: W, h: H }, [this.frames[k], fA], W, H);
+    const fr = await this.store.get(k);
+    K.gray_area.run2d({ W, H, w: W, h: H }, [fr, fA], W, H);
     K.box_blur.run2d({ W, H, r: rF, axis: 0, sub: 0 }, [fA, fA, fB], W, H);
     K.box_blur.run2d({ W, H, r: rF, axis: 1, sub: 1 }, [fB, fA, fC], W, H);   // fC = highpass
-    K.alpha_f32.run({ n: W * H }, [this.frames[k], fB], Math.ceil(W * H / 256)); // fB = clean
+    K.alpha_f32.run({ n: W * H }, [fr, fB], Math.ceil(W * H / 256)); // fB = clean
     const levels = {};
     let bytes = 0;
     for (const lv of lvs) {
@@ -338,14 +362,15 @@ export class Reconstructor {
       const keep = new Set(); sub.forEach((jb) => { keep.add(jb.i); keep.add(jb.j); });
       this._evictLevels(keep);
       const sjobs = []; const idx = [];
-      sub.forEach((jb, q) => {
+      for (let q = 0; q < sub.length; q++) {
+        const jb = sub[q];
         const H = this.H, W = this.W;
         const by0 = Math.max(0, -jb.dy), by1 = Math.min(H, H - jb.dy), bx0 = Math.max(0, -jb.dx), bx1 = Math.min(W, W - jb.dx);
-        if (by1 - by0 < 4 * jb.r + 16 || bx1 - bx0 < 4 * jb.r + 16) { out[b0 + q] = { ok: false }; return; }
-        const Li = this._levels(jb.i)[1.0], Lj = this._levels(jb.j)[1.0];
+        if (by1 - by0 < 4 * jb.r + 16 || bx1 - bx0 < 4 * jb.r + 16) { out[b0 + q] = { ok: false }; continue; }
+        const Li = (await this._levels(jb.i))[1.0], Lj = (await this._levels(jb.j))[1.0];
         sjobs.push({ A: Li.buf, B: Lj.buf, dx: jb.dx, dy: jb.dy, r: jb.r, nmin: 0.1 * (by1 - by0) * (bx1 - bx0) });
         idx.push(b0 + q);
-      });
+      }
       const K = this.k, g = this.gpu;
       sjobs.forEach((sj, slot) => {
         const nx = 2 * sj.r + 1;
@@ -387,7 +412,7 @@ export class Reconstructor {
       g.upload(this.state, st);
       for (let slot = 0; slot < sub.length; slot++) {
         const jb = sub[slot];
-        const Li = this._levels(jb.i), Lj = this._levels(jb.j);
+        const Li = await this._levels(jb.i), Lj = await this._levels(jb.j);
         for (const lv of lvs) {
           const A = Li[lv], B = Lj[lv];
           const npx = A.hs * A.ws;
@@ -414,6 +439,23 @@ export class Reconstructor {
       this._check();
     }
     return out;
+  }
+
+  /** ジョブ {i, j, ...} をフレーム順（i, j 昇順）に並べ替えて実行し、元の順で返す（ストリーミング時の読み直しを減らす） */
+  async _inFrameOrder(jobs, fn) {
+    const order = jobs.map((_, r) => r).sort((p, q) => jobs[p].i - jobs[q].i || jobs[p].j - jobs[q].j);
+    const out = await fn(order.map((r) => jobs[r]));
+    const res = new Array(jobs.length);
+    order.forEach((r, q) => { res[r] = out[q]; });
+    return res;
+  }
+
+  /** 粗探索データ（1/4, 1/16 レベル）を解放する。位置合わせ完了後に呼ぶ */
+  freeCoarse() {
+    const g = this.gpu;
+    for (const arr of [this.C4, this.C16]) for (let k = 0; k < this.n; k++) if (arr[k]) { g.free(arr[k]); arr[k] = null; }
+    for (const e of this.levelCache.values()) for (const lv of Object.keys(e.levels)) g.free(e.levels[lv].buf);
+    this.levelCache.clear(); this.levelBytes = 0;
   }
 
   // ------------------------------------------------------------ 位置合わせ全体
@@ -445,7 +487,7 @@ export class Reconstructor {
         else { d0 = [gc.T[j * 2] - gc.T[i * 2], gc.T[j * 2 + 1] - gc.T[i * 2 + 1]]; rr = rBig; }
         return { i, j, dx: Math.round(d0[0]), dy: Math.round(d0[1]), r: rr };
       });
-      const res = await this.fineTranslation(jobs);
+      const res = await this._inFrameOrder(jobs, (js) => this.fineTranslation(js));
       res.forEach((rs, r) => {
         if (!rs.ok) { ok[r] = false; return; }
         pf[r * 4] = 1; pf[r * 4 + 1] = 0; pf[r * 4 + 2] = rs.dx; pf[r * 4 + 3] = rs.dy; sf[r] = rs.score;
@@ -462,7 +504,7 @@ export class Reconstructor {
         }
         return { i, j, p0 };
       });
-      const res = await this.gnBatch(jobs);
+      const res = await this._inFrameOrder(jobs, (js) => this.gnBatch(js));
       res.forEach((rs, r) => {
         if (!rs.ok) { ok[r] = false; return; }
         pf[r * 4] = Math.exp(rs.p[0]); pf[r * 4 + 1] = rs.p[1]; pf[r * 4 + 2] = rs.p[2]; pf[r * 4 + 3] = rs.p[3]; sf[r] = rs.score;
@@ -488,7 +530,7 @@ export class Reconstructor {
           const relT = mulRot(rot2(-sol.TH[i]), dT).map((v) => v / sol.S[i]);
           return { i, j, p0: [Math.log(sol.S[j] / sol.S[i]), sol.TH[j] - sol.TH[i], relT[0], relT[1]] };
         });
-        const res = await this.gnBatch(jobs);
+        const res = await this._inFrameOrder(jobs, (js) => this.gnBatch(js));
         res.forEach((rs, q) => {
           if (!rs.ok) return;
           const k = redo[q]; const [i, j] = pairsOk[k];
@@ -522,15 +564,18 @@ export class Reconstructor {
       this.log(`  スケール: min=${Math.min(...sol.S).toFixed(4)} max=${Math.max(...sol.S).toFixed(4)} (frame0=1), ` +
                `回転: max |θ|=${(Math.max(...sol.TH.map(Math.abs)) * 180 / Math.PI).toFixed(3)}°`);
     }
+    this.freeCoarse();
+    if (!this.store.allResident) this.log(`  streaming: ${this.store.stats()}`);
     return { S: sol.S, TH: sol.TH, T: sol.T, pairs: pairsOk, pp: PF, sc: SF, rn };
   }
 
   /** フレーム k の RGBA（alpha = クリーンフラグ）を読み戻す */
-  async readFrame(k) { return new Uint8ClampedArray(await this.gpu.read(this.frames[k], this.W * this.H * 4)); }
+  async readFrame(k) { return this.store.readRGBA(k); }
 
   destroy() {
     const g = this.gpu;
-    for (const b of [...this.frames, ...this.C4, ...this.C16, ...this.f, ...this.c, ...this.s16,
+    this.store.destroy();
+    for (const b of [...this.C4, ...this.C16, ...this.f, ...this.c, ...this.s16,
                      this.sharpq, this.ratioBuf, this.surf, this.resBuf, this.Bs, this.hist, this.partials, this.state]) g.free(b);
     for (const e of this.levelCache.values()) for (const lv of Object.keys(e.levels)) g.free(e.levels[lv].buf);
     this.levelCache.clear();
