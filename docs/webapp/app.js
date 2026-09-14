@@ -282,6 +282,7 @@ $("run").onclick = run;
 // memory limit の値まで 512MB ずつ GPU バッファを実際に確保（clearBuffer で常駐させる）して確認する。
 // createBuffer の OOM は error scope で受けられるが、Dawn 内部の確保が失敗するとデバイス喪失になるので、
 // その場合はデバイスを作り直す。確保できなかった場合は上限を「確保できた量の 80%」に下げて保存する
+function median(a) { const s = [...a].sort((x, y) => x - y); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
 async function probeMemory() {
   if (running) return;
   running = true;
@@ -290,12 +291,16 @@ async function probeMemory() {
   const capGB = num("memLimit", 8);
   const cap = capGB > 0 ? capGB * 1073741824 : 64 * 1073741824;
   const bufs = [];
-  let total = 0, failed = null, g = null;
+  const times = [];          // ブロックごとの確保時間 [s]（createBuffer + clearBuffer 完了まで）
+  let total = 0, failed = null, g = null, slowFrom = -1;
+  const tProbe = performance.now();
   try {
     g = await ensureGpu();
     log(`[probe] ${(cap / 1073741824).toFixed(1)} GB まで 512MB ずつ GPU バッファを確保して確認します（動画は読み込みません）`);
+    log(`[probe] 各ブロックの確保時間も表示します。途中から急に遅くなる場合は仮想メモリ（ページファイル）に退避している可能性があります`);
     while (total + CH <= cap + 1) {
       const dev = g.device;
+      const t0 = performance.now();
       dev.pushErrorScope("out-of-memory");
       const b = dev.createBuffer({ size: CH, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
       const enc = dev.createCommandEncoder(); enc.clearBuffer(b); dev.queue.submit([enc.finish()]);
@@ -304,13 +309,26 @@ async function probeMemory() {
       await Promise.race([dev.queue.onSubmittedWorkDone(), dev.lost.then(() => "lost")]);
       if (g.lostInfo) { failed = new Error(g.lostMessage()); break; }
       bufs.push(b); total += CH;
+      const dt = (performance.now() - t0) / 1000;
+      times.push(dt);
       setProgress("probe", total / cap);
-      if (bufs.length % 4 === 0) log(`[probe] ${fmtMB(total)} OK`);
+      // 最初の数ブロックの中央値と比べて大きく遅くなった最初の位置を記録する（仮想メモリ退避の目安）
+      if (slowFrom < 0 && times.length > 4) {
+        const base = median(times.slice(0, 4));
+        if (dt > Math.max(0.25, base * 5)) { slowFrom = total; log(`[probe] ${fmtMB(total - CH)} → ${fmtMB(total)} の確保に ${dt.toFixed(2)}s（それまでは約 ${base.toFixed(2)}s）: ここから遅くなっています`); }
+      }
+      if (bufs.length % 4 === 0) log(`[probe] ${fmtMB(total)} OK（直近 4 ブロック: ${times.slice(-4).map((v) => v.toFixed(2)).join(" / ")} s）`);
     }
   } catch (e) {
     failed = e;
   }
+  const tAlloc = (performance.now() - tProbe) / 1000;
+  const tFree0 = performance.now();
   for (const b of bufs) { try { b.destroy(); } catch (e) { /* ignore */ } }
+  if (times.length) {
+    log(`[probe] 確保時間: 合計 ${tAlloc.toFixed(1)}s、512MB あたり 最小 ${Math.min(...times).toFixed(2)}s / 中央値 ${median(times).toFixed(2)}s / 最大 ${Math.max(...times).toFixed(2)}s（解放 ${((performance.now() - tFree0) / 1000).toFixed(2)}s）`);
+    if (slowFrom > 0) log(`[probe] ${fmtMB(slowFrom - CH)} 付近から確保が遅くなりました。クラッシュはしなくても、これを超える設定では処理が遅くなると思われます（memory limit を ${(Math.floor((slowFrom - CH) / CH) * 0.5).toFixed(1)} GB 程度にすると安全です）`);
+  }
   if (g && g.lostInfo) {
     // 喪失したデバイスを作り直す（gpu は lost ハンドラで null になっている）
     try { await ensureGpu(); } catch (e) { /* バナーに出ている */ }

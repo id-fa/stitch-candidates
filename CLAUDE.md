@@ -260,7 +260,8 @@ cd web && python -m http.server 8765   # ES モジュールのため file:// で
   `memory limit (GB)` 欄（既定 8、localStorage 保存）と照合する。`app.js` の `estimateMemory` / `checkMemoryPlan` が抽出前に総量を見積もって
   中止し、`Gpu.reserve` / `Gpu.buf` が確保時の安全網（`budgetBytes`）、`uncapturederror` の `GPUOutOfMemoryError` は `checkOom` で次の
   同期点に例外化。空きメモリ / VRAM を取得する Web API は無いので自動判定はしないが、「上限を確認」ボタン（`probeMemory`）で設定値まで
-  512MB ずつ実確保して検証できる（失敗時は確保量の 80% に下げて保存）。Dawn 内部の確保で D3D12 が OOM を返すとデバイス喪失になる
+  512MB ずつ実確保して検証できる（失敗時は確保量の 80% に下げて保存。ブロックごとの確保時間も表示し、最初の 4 ブロックの中央値の
+  5 倍かつ 0.25 s を超えたら「ここから遅くなっています」と出す＝仮想メモリ退避の目安。2026-09-14 追加）。Dawn 内部の確保で D3D12 が OOM を返すとデバイス喪失になる
   （オンボード GPU の共有メモリ予算はメインメモリよりずっと小さい。目安 4〜6 GB）。喪失は `Gpu.lostInfo` に記録し、`checkOom` と
   `run()` の catch で「GPU メモリ不足でデバイスが失われました」に差し替え、次の `ensureGpu()` で作り直す
 - ストリーミング（2026-09-14 追加）: `app.js` の `planMemory` が常駐 / ストリーミングを決め、`FrameStore` の常駐上限を渡す。
