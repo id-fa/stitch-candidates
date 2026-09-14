@@ -63,8 +63,9 @@
     <button id="cancel" disabled>中断</button>
     <button id="dlPositions" disabled>positions.csv</button>
     <button id="dlPairs" disabled>pairs.csv</button>
-    <label style="margin-left:12px">memory limit (GB)</label><input type="number" id="memLimit" value="8" step="1" min="0" style="width:60px">
-    <span class="hint">GPU バッファ確保量の上限。超える場合は開始前に中止（0 = 無制限。目安: メインメモリの 1/2 以下）</span>
+    <label style="margin-left:12px">memory limit (GB)</label><input type="number" id="memLimit" value="8" step="0.5" min="0" style="width:60px">
+    <button id="probe" title="動画を読み込まずに、この値まで 512MB ずつ実際に GPU バッファを確保して確認します。確保できなかった場合は上限を安全な値に下げます">上限を確認</button>
+    <span class="hint">GPU バッファ確保量の上限。超える場合は開始前に中止（0 = 無制限）。目安: ディスクリート GPU はメインメモリの 1/2 以下、オンボード GPU は 4〜6 GB から。「上限を確認」で実測できます</span>
   </div>
 <div class="row"><progress id="progress" value="0" max="1"></progress><span id="stage" class="hint">idle</span></div>
 </div>

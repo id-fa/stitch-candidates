@@ -48,7 +48,10 @@ export class Gpu {
     g.info = info;
     log(`[device] WebGPU ${info || "(adapter info unavailable)"}; maxBufferSize=${(device.limits.maxBufferSize / 1048576).toFixed(0)}MB, ` +
         `maxStorageBinding=${(device.limits.maxStorageBufferBindingSize / 1048576).toFixed(0)}MB`);
-    device.lost.then((info) => { log(`[device] LOST: ${info.reason} ${info.message}`); });
+    device.lost.then((info) => {
+      g.lostInfo = info;
+      if (info.reason !== "destroyed") log(`[device] LOST: ${info.reason} ${info.message}`);
+    });
     return g;
   }
 
@@ -67,6 +70,7 @@ export class Gpu {
     this.budgetBytes = 0;     // 確保総量の上限（0 = 無制限）。超える確保は例外にしてブラウザのクラッシュを避ける
     this.peakBytes = 0;
     this.oomError = null;     // uncapturederror で受けた out-of-memory
+    this.lostInfo = null;     // device.lost の情報（喪失後は全操作を例外にする）
     device.addEventListener("uncapturederror", (ev) => {
       const e = ev.error;
       if (typeof GPUOutOfMemoryError !== "undefined" && e instanceof GPUOutOfMemoryError) {
@@ -79,8 +83,20 @@ export class Gpu {
     this.zero = this.buf(4096);
   }
 
-  /** OOM が報告されていれば例外にする（同期点で呼ぶ） */
+  /** デバイス喪失を説明する文。OOM 起因（D3D12 の CreateCommittedResource 失敗など）なら上限の引き下げを促す */
+  lostMessage() {
+    const i = this.lostInfo;
+    if (!i) return null;
+    const oom = /OutOfMemory|E_OUTOFMEMORY|out of memory/i.test(i.message || "");
+    return oom
+      ? `GPU メモリ不足で GPU デバイスが失われました（Dawn 内部の確保に失敗: ${(i.message || "").split("\n")[0].trim()}）。` +
+        "memory limit をこの実行の確保量より十分小さくしてください（オンボード GPU は 4〜6 GB から。「上限を確認」で測定できます）。" +
+        "デバイスは次の実行時に作り直します"
+      : `GPU デバイスが失われました（${i.reason}: ${(i.message || "").split("\n")[0].trim()}）。デバイスは次の実行時に作り直します`;
+  }
+  /** OOM / デバイス喪失が起きていれば例外にする（同期点で呼ぶ） */
   checkOom() {
+    if (this.lostInfo && this.lostInfo.reason !== "destroyed") throw new Error(this.lostMessage());
     if (this.oomError) throw new Error(`GPU メモリ不足です（${this.oomError.message}）。fps / max frames / input scale を下げるか Trim で範囲を絞ってください`);
   }
   /** これから size バイト確保しても上限内か確認する（超えるなら例外） */

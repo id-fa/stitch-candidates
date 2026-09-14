@@ -30,11 +30,10 @@ async function ensureGpu() {
   try {
     gpu = await Gpu.create(log);
     gpuError = null;
-    gpu.device.lost.then((info) => {
-      gpu = null;
-      if (info.reason !== "destroyed") {
-        showGpuStatus("err", `GPU デバイスが失われました（${info.reason}: ${info.message}）。ページを再読み込みしてください`);
-      }
+    const g = gpu;
+    g.device.lost.then((info) => {
+      if (gpu === g) gpu = null;   // 次の ensureGpu() で作り直す
+      if (info.reason !== "destroyed") showGpuStatus("err", g.lostMessage());
     });
     showGpuStatus("ok", `WebGPU 利用可能: ${gpu.info || "(adapter info unavailable)"}`);
     return gpu;
@@ -241,14 +240,15 @@ async function makeOverlayDebug(rc) {
 async function run() {
   if (running) return;
   running = true;
-  $("run").disabled = true; $("cancel").disabled = false;
+  $("run").disabled = true; $("cancel").disabled = false; $("probe").disabled = true;
   logEl.textContent = "";
   $("tabs").innerHTML = ""; $("view").innerHTML = "";
   for (const k of Object.keys(results)) delete results[k];
   const tAll = performance.now();
+  let runGpu = null;
   try {
     const args = readArgs();
-    await ensureGpu();
+    runGpu = await ensureGpu();
     const files = selectedFiles;
     if (!files.length) throw new Error("動画ファイルまたはフレーム画像を選択（またはドロップ）してください");
     outPrefix = files[0].name.replace(/\.[^.]+$/, "") + "_";
@@ -308,21 +308,75 @@ async function run() {
     }
     log(`[done] total ${((performance.now() - tAll) / 1000).toFixed(1)}s, GPU buffer peak ${fmtMB(gpu.peakBytes)}`);
   } catch (e) {
-    log(`[error] ${e.message || e}`);
+    const lost = runGpu && runGpu.lostInfo && runGpu.lostInfo.reason !== "destroyed" ? runGpu.lostMessage() : null;
+    log(`[error] ${lost || e.message || e}`);
+    if (lost && (e.message || String(e)) !== lost) log(`  (直接の例外: ${e.message || e})`);
     console.error(e);
   } finally {
     if (rc) {
-      try { await gpu.done(); } catch (e) { /* ignore */ }
+      try { if (gpu) await gpu.done(); } catch (e) { /* ignore */ }
       if (window.__keepRc) window.__rc = rc; else rc.destroy();   // __keepRc: デバッグ用に GPU 資源を保持
       rc = null;
     }
     running = false;
-    $("run").disabled = !!gpuError; $("cancel").disabled = true;
+    $("run").disabled = !!gpuError; $("cancel").disabled = true; $("probe").disabled = !!gpuError;
     setProgress("idle", 0);
   }
 }
 
 $("run").onclick = run;
+
+// ------------------------------------------------------------ メモリ上限の実測
+// memory limit の値まで 512MB ずつ GPU バッファを実際に確保（clearBuffer で常駐させる）して確認する。
+// createBuffer の OOM は error scope で受けられるが、Dawn 内部の確保が失敗するとデバイス喪失になるので、
+// その場合はデバイスを作り直す。確保できなかった場合は上限を「確保できた量の 80%」に下げて保存する
+async function probeMemory() {
+  if (running) return;
+  running = true;
+  $("run").disabled = true; $("probe").disabled = true;
+  const CH = 512 * 1048576;
+  const capGB = num("memLimit", 8);
+  const cap = capGB > 0 ? capGB * 1073741824 : 64 * 1073741824;
+  const bufs = [];
+  let total = 0, failed = null, g = null;
+  try {
+    g = await ensureGpu();
+    log(`[probe] ${(cap / 1073741824).toFixed(1)} GB まで 512MB ずつ GPU バッファを確保して確認します（動画は読み込みません）`);
+    while (total + CH <= cap + 1) {
+      const dev = g.device;
+      dev.pushErrorScope("out-of-memory");
+      const b = dev.createBuffer({ size: CH, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      const enc = dev.createCommandEncoder(); enc.clearBuffer(b); dev.queue.submit([enc.finish()]);
+      const err = await Promise.race([dev.popErrorScope(), dev.lost.then(() => "lost")]);
+      if (err) { failed = err === "lost" ? new Error(g.lostMessage() || "device lost") : err; try { b.destroy(); } catch (e) { /* ignore */ } break; }
+      await Promise.race([dev.queue.onSubmittedWorkDone(), dev.lost.then(() => "lost")]);
+      if (g.lostInfo) { failed = new Error(g.lostMessage()); break; }
+      bufs.push(b); total += CH;
+      setProgress("probe", total / cap);
+      if (bufs.length % 4 === 0) log(`[probe] ${fmtMB(total)} OK`);
+    }
+  } catch (e) {
+    failed = e;
+  }
+  for (const b of bufs) { try { b.destroy(); } catch (e) { /* ignore */ } }
+  if (g && g.lostInfo) {
+    // 喪失したデバイスを作り直す（gpu は lost ハンドラで null になっている）
+    try { await ensureGpu(); } catch (e) { /* バナーに出ている */ }
+  }
+  if (failed) {
+    const rec = Math.max(0.5, Math.floor(total * 0.8 / (512 * 1048576)) * 0.5);
+    log(`[probe] ${fmtMB(total)} まで確保できましたが、次の 512MB で失敗しました: ${failed.message || failed}`);
+    log(`[probe] memory limit を ${rec} GB に設定しました（確保できた量の 80%）。実行時はブラウザ本体や動画デコードの分も要るので、これでも失敗するならさらに下げてください`);
+    $("memLimit").value = String(rec);
+    $("memLimit").dispatchEvent(new Event("change"));
+  } else {
+    log(`[probe] ${fmtMB(total)} まで確保できました。memory limit ${capGB > 0 ? capGB + " GB" : "なし"} のままで問題ありません`);
+  }
+  running = false;
+  $("run").disabled = !!gpuError; $("probe").disabled = !!gpuError;
+  setProgress("idle", 0);
+}
+$("probe").onclick = probeMemory;
 $("cancel").onclick = () => { if (rc) rc.abort = true; };
 const isVideoFile = (f) => f.type.startsWith("video/") || /\.(mp4|webm|mov|m4v|mkv)$/i.test(f.name);
 // Trim / Crop パネル: 無視/テキスト矩形はクロップ後座標でパラメータ欄に書き戻す。実測 fps は fps 欄の既定値にする

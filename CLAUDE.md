@@ -258,7 +258,10 @@ cd web && python -m http.server 8765   # ES モジュールのため file:// で
 - メモリ上限（2026-09-14 追加）: 全フレーム GPU 常駐のため 1080p で約 9 MB/frame。メインメモリ不足でブラウザがクラッシュするのを避けるため、
   `memory limit (GB)` 欄（既定 8、localStorage 保存）と照合する。`app.js` の `estimateMemory` / `checkMemoryPlan` が抽出前に総量を見積もって
   中止し、`Gpu.reserve` / `Gpu.buf` が確保時の安全網（`budgetBytes`）、`uncapturederror` の `GPUOutOfMemoryError` は `checkOom` で次の
-  同期点に例外化。空きメモリ / VRAM を取得する Web API は無いので自動判定はしない
+  同期点に例外化。空きメモリ / VRAM を取得する Web API は無いので自動判定はしないが、「上限を確認」ボタン（`probeMemory`）で設定値まで
+  512MB ずつ実確保して検証できる（失敗時は確保量の 80% に下げて保存）。Dawn 内部の確保で D3D12 が OOM を返すとデバイス喪失になる
+  （オンボード GPU の共有メモリ予算はメインメモリよりずっと小さい。目安 4〜6 GB）。喪失は `Gpu.lostInfo` に記録し、`checkOom` と
+  `run()` の catch で「GPU メモリ不足でデバイスが失われました」に差し替え、次の `ensureGpu()` で作り直す
 - ファイル: `index.html` (UI), `app.js` (入出力), `trim.js` (トリム/クロップ), `gpu.js` (基盤), `shaders_img.js` / `shaders_align.js` /
   `shaders_render.js` (WGSL), `recon.js` (位置合わせ), `render.js` (合成), `postfx.js` (穴埋め), `solve.js` (CPU 最小二乗)
 
