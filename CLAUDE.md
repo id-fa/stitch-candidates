@@ -255,6 +255,10 @@ cd web && python -m http.server 8765   # ES モジュールのため file:// で
 - WebGPU の可否はページ表示時に `Gpu.create` を先行実行して判定し（`app.js` の `ensureGpu`）、`#gpuStatus` バナーに表示。
   失敗時は「実行」を無効化。`gpu.js` の例外メッセージが原因別（非対応 / 非セキュアコンテキスト / アダプタ取得不可 =
   グラフィックアクセラレーション OFF / デバイス作成失敗）の対処を含む（2026-09-14 追加）
+- メモリ上限（2026-09-14 追加）: 全フレーム GPU 常駐のため 1080p で約 9 MB/frame。メインメモリ不足でブラウザがクラッシュするのを避けるため、
+  `memory limit (GB)` 欄（既定 8、localStorage 保存）と照合する。`app.js` の `estimateMemory` / `checkMemoryPlan` が抽出前に総量を見積もって
+  中止し、`Gpu.reserve` / `Gpu.buf` が確保時の安全網（`budgetBytes`）、`uncapturederror` の `GPUOutOfMemoryError` は `checkOom` で次の
+  同期点に例外化。空きメモリ / VRAM を取得する Web API は無いので自動判定はしない
 - ファイル: `index.html` (UI), `app.js` (入出力), `trim.js` (トリム/クロップ), `gpu.js` (基盤), `shaders_img.js` / `shaders_align.js` /
   `shaders_render.js` (WGSL), `recon.js` (位置合わせ), `render.js` (合成), `postfx.js` (穴埋め), `solve.js` (CPU 最小二乗)
 

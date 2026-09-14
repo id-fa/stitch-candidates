@@ -7,6 +7,7 @@ const UNIFORM_SLOT = 256;         // 動的オフセットの最小アライメ�
 const ARENA_BYTES = 16 * 1024 * 1024;
 
 let _bufId = 1;
+export const fmtMB = (b) => b >= 1073741824 ? `${(b / 1073741824).toFixed(2)}GB` : `${(b / 1048576).toFixed(0)}MB`;
 
 export class Gpu {
   static async create(log) {
@@ -63,11 +64,37 @@ export class Gpu {
     this.encoder = null;
     this.bgCache = new Map();
     this.allocBytes = 0;
+    this.budgetBytes = 0;     // 確保総量の上限（0 = 無制限）。超える確保は例外にしてブラウザのクラッシュを避ける
+    this.peakBytes = 0;
+    this.oomError = null;     // uncapturederror で受けた out-of-memory
+    device.addEventListener("uncapturederror", (ev) => {
+      const e = ev.error;
+      if (typeof GPUOutOfMemoryError !== "undefined" && e instanceof GPUOutOfMemoryError) {
+        this.oomError = e;
+        log(`[device] out-of-memory: ${e.message}`);
+      } else {
+        log(`[device] ${e.constructor?.name || "error"}: ${e.message}`);
+      }
+    });
     this.zero = this.buf(4096);
+  }
+
+  /** OOM が報告されていれば例外にする（同期点で呼ぶ） */
+  checkOom() {
+    if (this.oomError) throw new Error(`GPU メモリ不足です（${this.oomError.message}）。fps / max frames / input scale を下げるか Trim で範囲を絞ってください`);
+  }
+  /** これから size バイト確保しても上限内か確認する（超えるなら例外） */
+  reserve(size, what = "GPU バッファ") {
+    this.checkOom();
+    if (this.budgetBytes > 0 && this.allocBytes + size > this.budgetBytes) {
+      throw new Error(`メモリ上限を超えるため中止しました: ${what} ${fmtMB(size)} を確保すると合計 ${fmtMB(this.allocBytes + size)} > 上限 ${fmtMB(this.budgetBytes)}。` +
+                      "fps / max frames / input scale を下げるか Trim で範囲を絞るか、memory limit を上げてください");
+    }
   }
 
   // ---- バッファ ----
   buf(size, label) {
+    this.reserve(size, label || "buffer");
     const b = this.device.createBuffer({
       size: Math.max(16, Math.ceil(size / 16) * 16), label,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
@@ -75,6 +102,7 @@ export class Gpu {
     b._id = _bufId++;
     b._size = size;
     this.allocBytes += b.size;
+    if (this.allocBytes > this.peakBytes) this.peakBytes = this.allocBytes;
     return b;
   }
   free(b) {
@@ -120,7 +148,7 @@ export class Gpu {
     st.destroy();
     return out;
   }
-  async done() { this.submit(); await this.device.queue.onSubmittedWorkDone(); }
+  async done() { this.submit(); await this.device.queue.onSubmittedWorkDone(); this.checkOom(); }
 
   // ---- uniform アリーナ ----
   _allocUniform() {

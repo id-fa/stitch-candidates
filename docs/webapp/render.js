@@ -45,6 +45,7 @@ export async function render(rc, al) {
   const resLv = a.resTol > 0 ? Math.round(Math.log2(a.resTol) * 12) : 255;
   const anchor = Number.isFinite(a.anchorFrame) && a.anchorFrame >= 0 ? [Math.max(0, a.anchorFrame - a.anchorWindow), Math.min(n - 1, a.anchorFrame + a.anchorWindow)] : null;
   rc.log(`[render] canvas ${Wc}x${Hc}, canvas scale=${gsc.toFixed(4)}, band=${bh}, res tol=${a.resTol}` + (anchor ? `, anchor frames ${anchor[0]}-${anchor[1]}` : ""));
+  g.reserve(n * bh * Wc * 8 + outBytes * 4 + W * H * 16 * 2, `render (canvas ${Wc}x${Hc})`);
   const t0 = now();
   const stack = g.buf(n * bh * Wc * 8, "stack");
   const outMed = g.buf(outBytes, "out_med"), outMean = g.buf(outBytes, "out_mean"), outSharp = g.buf(outBytes, "out_sharp"), outCov = g.buf(outBytes, "out_cov");

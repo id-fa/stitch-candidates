@@ -1,7 +1,7 @@
 // app.js - UI、フレーム読み込み（動画シーク抽出 / 画像列）、出力
 
-import { Gpu } from "./gpu.js";
-import { Reconstructor } from "./recon.js";
+import { Gpu, fmtMB } from "./gpu.js";
+import { Reconstructor, DEFAULTS } from "./recon.js";
 import { render } from "./render.js";
 import { fillHoles } from "./postfx.js";
 import { TrimPanel } from "./trim.js";
@@ -53,6 +53,41 @@ const results = {};   // name -> {canvas, w, h}
 function setProgress(stage, frac) {
   $("progress").value = frac;
   $("stage").textContent = `${stage} ${(frac * 100).toFixed(0)}%`;
+}
+
+// メモリ上限（GB）: localStorage に保存。VRAM や空きメモリを取得する Web API は無いので利用者が設定する
+try { const v = localStorage.getItem("memLimitGB"); if (v !== null && v !== "") $("memLimit").value = v; } catch (e) { /* ignore */ }
+$("memLimit").onchange = () => { try { localStorage.setItem("memLimitGB", $("memLimit").value); } catch (e) { /* ignore */ } };
+const memLimitBytes = () => Math.max(0, num("memLimit", 8)) * 1073741824;
+
+// GPU バッファ総量の見積もり（recon.js / render.js の確保に合わせる）。キャンバス出力（位置合わせ後に決まる）は含まない
+function estimateMemory(n, W, H, args0) {
+  const args = { ...DEFAULTS, ...args0 };
+  const cs = args.coarseScale;
+  const hc = Math.max(16, Math.round(H * cs)), wc = Math.max(16, Math.round(W * cs));
+  const h16 = Math.max(16, Math.round(hc / 4)), w16 = Math.max(16, Math.round(wc / 4));
+  const Hq = Math.max(1, Math.floor(H / 4)), Wq = Math.max(1, Math.floor(W / 4));
+  const frames = n * W * H * 4;
+  const pre = n * (wc * hc * 8 + w16 * h16 * 8 + Hq * Wq * 4);
+  const work = 6 * W * H * 4 + 3 * hc * wc * 4 + Math.max(hc * wc * 16, W * H * 8) + 16 * 1048576 * 2 +
+               args.levelCacheMB * 1048576 + args.stackBudgetMB * 1048576 + 2 * W * H * 16;
+  return { frames, pre, work, total: frames + pre + work, perFrame: W * H * 4 + (wc * hc * 8 + w16 * h16 * 8 + Hq * Wq * 4) };
+}
+// フレーム数と解像度が確定した時点（抽出前）で上限と照合する
+function checkMemoryPlan(n, W, H, args) {
+  const est = estimateMemory(n, W, H, args);
+  const lim = memLimitBytes();
+  log(`[memory] 推定 GPU バッファ ${fmtMB(est.total)}（フレーム ${fmtMB(est.frames)} + 前処理 ${fmtMB(est.pre)} + 作業領域 ${fmtMB(est.work)}、` +
+      `${fmtMB(est.perFrame)}/frame）、上限 ${lim > 0 ? fmtMB(lim) : "なし"}`);
+  if (lim > 0 && est.total > lim) {
+    const maxN = Math.max(0, Math.floor((lim - est.work) / est.perFrame));
+    if (maxN < 2) throw new Error(`メモリ上限を超えるため中止しました: ${n} frames ${W}x${H} で推定 ${fmtMB(est.total)} > 上限 ${fmtMB(lim)}。` +
+                                  `作業領域（level cache MB + stack budget MB + スクラッチ ${fmtMB(est.work)}）だけで上限に達します。上限（memory limit）を上げるか level cache MB を下げてください`);
+    throw new Error(`メモリ上限を超えるため中止しました: ${n} frames ${W}x${H} で推定 ${fmtMB(est.total)} > 上限 ${fmtMB(lim)}。\n` +
+                    `この解像度で収まるのは約 ${maxN} frames です。fps / max frames を下げる、Trim で範囲を絞る、input scale を下げる（0.5 で 1/4）、` +
+                    `または上限（memory limit）を上げてください（ブラウザがクラッシュしない範囲で）`);
+  }
+  return est;
 }
 
 function num(id, def) { const v = parseFloat($(id).value); return Number.isFinite(v) ? v : def; }
@@ -111,6 +146,7 @@ async function loadVideoFrames(file, opts, onFrame) {
   log(`[load] video ${v.videoWidth}x${v.videoHeight} ${dur.toFixed(2)}s, range ${t0.toFixed(3)}-${t1.toFixed(3)}s` +
       (opts.trim ? ` (frames ${opts.trim.startFrame}-${opts.trim.endFrame} @ ${opts.trim.fps} fps)` : "") +
       (opts.crop ? `, crop ${crop.join(",")}` : "") + ` → ${times.length} frames @ ${opts.fps} fps, scale ${opts.inputScale}`);
+  if (opts.onPlan) opts.onPlan(times.length, W, H);
   const frames = [];
   for (let k = 0; k < times.length; k++) {
     await new Promise((res, rej) => {
@@ -139,6 +175,7 @@ async function loadImageFrames(files, opts, onFrame) {
       W = Math.max(8, Math.round(bmp.width * opts.inputScale)); H = Math.max(8, Math.round(bmp.height * opts.inputScale));
       cv = frameCanvas(W, H); ctx = cv.getContext("2d", { willReadFrequently: true });
       log(`[load] ${sel.length} images ${bmp.width}x${bmp.height} → ${W}x${H}`);
+      if (opts.onPlan) opts.onPlan(sel.length, W, H);
     }
     ctx.drawImage(bmp, 0, 0, W, H);
     bmp.close();
@@ -216,7 +253,10 @@ async function run() {
     if (!files.length) throw new Error("動画ファイルまたはフレーム画像を選択（またはドロップ）してください");
     outPrefix = files[0].name.replace(/\.[^.]+$/, "") + "_";
     const opts = { fps: num("fps", 10), start: num("start", 0), duration: num("duration", 0), maxFrames: int("maxFrames", 0),
-                   inputScale: num("inputScale", 1.0), every: Math.max(1, int("every", 1)) };
+                   inputScale: num("inputScale", 1.0), every: Math.max(1, int("every", 1)),
+                   onPlan: (n, W, H) => checkMemoryPlan(n, W, H, args) };
+    gpu.budgetBytes = memLimitBytes();
+    gpu.peakBytes = gpu.allocBytes;
     const onFrame = (k, rgba) => { const b = gpu.buf(rgba.byteLength, `frame${k}`); gpu.upload(b, rgba); return b; };
     const isVideo = files.length === 1 && isVideoFile(files[0]);
     if (isVideo) {
@@ -266,7 +306,7 @@ async function run() {
       showImage("coverage", cov, res.Wc, res.Hc, "coverage");
       showImage("recon_median", res.median, res.Wc, res.Hc, "median");
     }
-    log(`[done] total ${((performance.now() - tAll) / 1000).toFixed(1)}s`);
+    log(`[done] total ${((performance.now() - tAll) / 1000).toFixed(1)}s, GPU buffer peak ${fmtMB(gpu.peakBytes)}`);
   } catch (e) {
     log(`[error] ${e.message || e}`);
     console.error(e);
