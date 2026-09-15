@@ -77,15 +77,15 @@ export async function render(rc, al) {
     let bw = Math.max(4, a.band | 0);
     let tiles = tilesFor(bw, use);
     let Kmax = Math.max(1, ...tiles.map((t) => t.ks.length));
-    if (Kmax * bw * L * 8 > budget) {
-      bw = Math.max(4, Math.floor(budget / (Kmax * L * 8)));
+    if (Kmax * bw * L * 12 > budget) {
+      bw = Math.max(4, Math.floor(budget / (Kmax * L * 12)));
       tiles = tilesFor(bw, use);
       Kmax = Math.max(1, ...tiles.map((t) => t.ks.length));
     }
     return { bw, tiles, Kmax };
   };
   let sel = pick(() => true);
-  const needOf = (s) => s.Kmax * s.bw * L * 8 + outBytes * 4 + W * H * 16 * 2;
+  const needOf = (s) => s.Kmax * s.bw * L * 12 + outBytes * 5 + W * H * 16 * 2;
   // フレームキャッシュ: 合成で必要なバッファ（スタック、出力 4 面、ぼかし作業）を引いた残りに合わせる
   let cacheFrames = st.maxResident;
   if (g.budgetBytes > 0) {
@@ -111,21 +111,28 @@ export async function render(rc, al) {
   const need = needOf(sel);
   g.reserve(need, `render (canvas ${Wc}x${Hc})`);
   const t0 = now();
-  const stack = g.buf(Kmax * bw * L * 8, "stack");
+  const stack = g.buf(Kmax * bw * L * 12, "stack");   // 1 標本 3 ワード（rgb+flags, 鮮明度, フェザー重み）
   const outMed = g.buf(outBytes, "out_med"), outMean = g.buf(outBytes, "out_mean"), outSharp = g.buf(outBytes, "out_sharp"), outCov = g.buf(outBytes, "out_cov");
+  const outBlend = g.buf(outBytes, "out_blend");
   const tmp1 = g.buf(W * H * 16, "blur_tmp1"), tmp2 = g.buf(W * H * 16, "blur_tmp2");
-  // 露出補正: プロファイル（節点 + f(y) + g(x)、0..255 単位）を小さなバッファで渡し、フレームごとのゲイン / オフセットは uniform
+  // 露出補正: プロファイル（節点 + f(y) + g(x)）と局所場（フレームごとの格子）を 1 つのバッファ（0..255 単位）で渡し、
+  // フレームごとのゲイン / オフセットは uniform
   const ex = rc.exposure;
-  let expoBuf = g.zero, nk = 0;
-  if (ex && ex.profile) {
-    nk = ex.knots.length;
-    const arr = new Float32Array(nk + 2 * nk * 3);
+  let expoBuf = g.zero, nk = 0, gxg = 0, gyg = 0, NG = 0, locBase = 0;
+  if (ex && (ex.profile || ex.local)) {
+    nk = ex.profile ? ex.knots.length : 0;
+    if (ex.local) { [gxg, gyg] = ex.localGrid; NG = (gxg + 1) * (gyg + 1); }
+    locBase = nk + 2 * nk * 3;
+    const arr = new Float32Array(locBase + n * NG * 3);
     for (let q = 0; q < nk; q++) arr[q] = ex.knots[q];
     for (let q = 0; q < nk * 3; q++) { arr[nk + q] = ex.profile.fy[q] * 255; arr[nk + nk * 3 + q] = ex.profile.gx[q] * 255; }
+    for (let q = 0; q < n * NG * 3; q++) arr[locBase + q] = ex.local[q] * 255;
     expoBuf = g.buf(arr.byteLength, "expo");
     g.upload(expoBuf, arr);
   }
-  if (ex) rc.log(`[render] 露出補正を適用${ex.profile ? "（ゲイン / オフセット + 周辺プロファイル）" : "（ゲイン / オフセット）"}`);
+  const feather = Math.max(0, a.feather || 0);
+  if (ex) rc.log(`[render] 露出補正を適用（ゲイン / オフセット${ex.profile ? " + 周辺プロファイル" : ""}${ex.local ? ` + 局所場 ${gxg}x${gyg}` : ""}）` +
+                 (feather > 0 ? `、フェザー合成 ${feather.toFixed(0)} px` : ""));
   let nb = 0;
   for (const tile of tiles) {
     const x0 = horiz ? tile.t0 : 0, y0 = horiz ? 0 : tile.t0;
@@ -158,7 +165,7 @@ export async function render(rc, al) {
         const gain = ex ? [ex.gain[k * 3], ex.gain[k * 3 + 1], ex.gain[k * 3 + 2], 1] : [1, 1, 1, 1];
         const off = ex ? [ex.offset[k * 3] * 255, ex.offset[k * 3 + 1] * 255, ex.offset[k * 3 + 2] * 255, 0] : [0, 0, 0, 0];
         K.warp.run2d({ x0, y0, tw, th, W, H, Wq: rc.Wq, Hq: rc.Hq, slot, sharp_off: k * rc.Hq * rc.Wq, use_blur: useBlur, s, c, sn, Tx, Ty, mag_lv: magLevel(s),
-                       vw: sizes[k][0], vh: sizes[k][1], use_expo: ex ? 1 : 0, nk, gain, off },
+                       vw: sizes[k][0], vh: sizes[k][1], use_expo: ex ? 1 : 0, nk, loc_off: locBase + k * NG * 3, gx: gxg, gy: gyg, feather, gain, off },
           [fr, tmp2, rc.sharpq, stack, expoBuf], tw, th);
       }
       // アンカーフレームのスロット範囲（ks は昇順なので連続）。無ければ lo > hi
@@ -168,7 +175,7 @@ export async function render(rc, al) {
         if (idx.length) { ancLo = idx[0]; ancHi = idx[idx.length - 1]; }
       }
       K.median.run2d({ Wc, x0, y0, tw, th, K: ks.length, tol: a.inlierTol * 255.0, sharp_top: a.sharpTop, res_lv: resLv, anc_lo: ancLo, anc_hi: ancHi },
-        [stack, outMed, outMean, outSharp, outCov], tw, th);
+        [stack, outMed, outMean, outSharp, outCov, outBlend], tw, th);
     }
     nb++;
     if (nb % 4 === 0) { await g.done(); rc.progress("render", nb / tiles.length); rc._check(); }
@@ -176,6 +183,7 @@ export async function render(rc, al) {
   const med = new Uint8ClampedArray(await g.read(outMed, outBytes));
   const mn = new Uint8ClampedArray(await g.read(outMean, outBytes));
   const sh = new Uint8ClampedArray(await g.read(outSharp, outBytes));
+  const bl = feather > 0 ? new Uint8ClampedArray(await g.read(outBlend, outBytes)) : null;
   const covRaw = new Uint32Array(await g.read(outCov, outBytes));
   const cov = new Uint32Array(covRaw.length), covG = new Uint32Array(covRaw.length);
   let holes = 0, fallback = 0;
@@ -183,10 +191,10 @@ export async function render(rc, al) {
     cov[i] = covRaw[i] & 0xffff; covG[i] = covRaw[i] >>> 16;
     if (covG[i] === 0) holes++; else if (cov[i] === 0) fallback++;
   }
-  for (const b of [stack, outMed, outMean, outSharp, outCov, tmp1, tmp2]) g.free(b);
+  for (const b of [stack, outMed, outMean, outSharp, outCov, outBlend, tmp1, tmp2]) g.free(b);
   if (expoBuf !== g.zero) g.free(expoBuf);
   rc.log(`[render] done ${(now() - t0).toFixed(1)}s, uncovered px=${holes}, fallback (no clean sample) px=${fallback}` +
          (st.allResident ? "" : ` (streaming, ${st.stats()})`));
   rc.progress("render", 1);
-  return { Wc, Hc, median: med, mean: mn, sharp: sh, coverage: cov, coverageGeom: covG, canvasScale: gsc };
+  return { Wc, Hc, median: med, mean: mn, sharp: sh, blend: bl, coverage: cov, coverageGeom: covG, canvasScale: gsc };
 }

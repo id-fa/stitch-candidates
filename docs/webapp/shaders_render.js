@@ -37,16 +37,20 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 };
 
 //   vw, vh: フレームの有効サイズ（パディング領域は幾何的に無効として扱う）
-//   露出補正: use_expo=1 なら col = (col - off - 255 (f(y/vh) + g(x/vw))) / gain。expo バッファ: [knots(nk), fy(nk*3), gx(nk*3)]（0..255 単位）
+//   露出補正: use_expo=1 なら col = (col - off - 255 (f(y/vh) + g(x/vw)) - F_k(x, y)) / gain。
+//   expo バッファ: [knots(nk), fy(nk*3), gx(nk*3), 局所場 F（フレームごと (gx+1)(gy+1)*3、loc_off から）]（0..255 単位）
+//   スタックは 1 標本 3 ワード: word0 = rgb+flags, word1 = 鮮明度, word2 = フェザー重み（フレーム端からの距離 / feather、0..1）
 RENDER.warp = {
   fields: [["x0", "u32"], ["y0", "u32"], ["tw", "u32"], ["th", "u32"], ["W", "u32"], ["H", "u32"], ["Wq", "u32"], ["Hq", "u32"],
            ["slot", "u32"], ["sharp_off", "u32"], ["use_blur", "u32"],
            ["s", "f32"], ["c", "f32"], ["sn", "f32"], ["Tx", "f32"], ["Ty", "f32"], ["mag_lv", "u32"],
-           ["vw", "u32"], ["vh", "u32"], ["use_expo", "u32"], ["nk", "u32"], ["gain", "vec4f"], ["off", "vec4f"]],
+           ["vw", "u32"], ["vh", "u32"], ["use_expo", "u32"], ["nk", "u32"], ["loc_off", "u32"], ["gx", "u32"], ["gy", "u32"], ["feather", "f32"],
+           ["gain", "vec4f"], ["off", "vec4f"]],
   bindings: ["r", "r", "r", "rw", "r"], wg: [16, 16, 1],
   code: /* wgsl */ `
 struct P { x0: u32, y0: u32, tw: u32, th: u32, W: u32, H: u32, Wq: u32, Hq: u32, slot: u32, sharp_off: u32, use_blur: u32,
-           s: f32, c: f32, sn: f32, Tx: f32, Ty: f32, mag_lv: u32, vw: u32, vh: u32, use_expo: u32, nk: u32, gain: vec4<f32>, off: vec4<f32> }
+           s: f32, c: f32, sn: f32, Tx: f32, Ty: f32, mag_lv: u32, vw: u32, vh: u32, use_expo: u32, nk: u32, loc_off: u32, gx: u32, gy: u32, feather: f32,
+           gain: vec4<f32>, off: vec4<f32> }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> frame: array<u32>;
 @group(0) @binding(2) var<storage, read> blurred: array<vec4<f32>>;
@@ -67,18 +71,37 @@ fn prof(t_in: f32, base: u32) -> vec3<f32> {
   let b = vec3<f32>(expo[base + (q + 1u) * 3u], expo[base + (q + 1u) * 3u + 1u], expo[base + (q + 1u) * 3u + 2u]);
   return a * (1.0 - f) + b * f;
 }
+// 局所オフセット場（双一次格子 (gx+1)x(gy+1)、正規化座標 0..1）
+fn local_field(xn: f32, yn: f32) -> vec3<f32> {
+  let u = clamp(xn, 0.0, 1.0) * f32(p.gx); let v = clamp(yn, 0.0, 1.0) * f32(p.gy);
+  let q0 = min(u32(floor(u)), p.gx - 1u); let r0 = min(u32(floor(v)), p.gy - 1u);
+  let fu = clamp(u - f32(q0), 0.0, 1.0); let fv = clamp(v - f32(r0), 0.0, 1.0);
+  let b = p.loc_off + (r0 * (p.gx + 1u) + q0) * 3u;
+  let s1 = p.gx + 1u;
+  let v00 = vec3<f32>(expo[b], expo[b + 1u], expo[b + 2u]);
+  let v10 = vec3<f32>(expo[b + 3u], expo[b + 4u], expo[b + 5u]);
+  let v01 = vec3<f32>(expo[b + s1 * 3u], expo[b + s1 * 3u + 1u], expo[b + s1 * 3u + 2u]);
+  let v11 = vec3<f32>(expo[b + s1 * 3u + 3u], expo[b + s1 * 3u + 4u], expo[b + s1 * 3u + 5u]);
+  return v00 * (1.0 - fu) * (1.0 - fv) + v10 * fu * (1.0 - fv) + v01 * (1.0 - fu) * fv + v11 * fu * fv;
+}
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let x = g.x; let yy = g.y;
   if (x >= p.tw || yy >= p.th) { return; }
-  let o = ((p.slot * p.th + yy) * p.tw + x) * 2u;
+  let o = ((p.slot * p.th + yy) * p.tw + x) * 3u;
   let X = f32(p.x0 + x); let Y = f32(p.y0 + yy);
   let u = (X - p.Tx) / p.s; let v = (Y - p.Ty) / p.s;
   let fx = p.c * u + p.sn * v; let fy = -p.sn * u + p.c * v;
   let W = i32(p.W); let H = i32(p.H);
   let eps = 1e-3;
   if (fx < -eps || fx > f32(i32(p.vw) - 1) + eps || fy < -eps || fy > f32(i32(p.vh) - 1) + eps) {
-    stack[o] = 0u; stack[o + 1u] = 0u; return;
+    stack[o] = 0u; stack[o + 1u] = 0u; stack[o + 2u] = 0u; return;
+  }
+  // フェザー重み: 有効領域の端からの距離（フレーム px）/ feather を 0..1 に
+  var fwt = 1.0;
+  if (p.feather > 0.0) {
+    let de = min(min(fx, f32(p.vw - 1u) - fx), min(fy, f32(p.vh - 1u) - fy));
+    fwt = clamp(de / p.feather, 0.0, 1.0);
   }
   let x0f = floor(fx); let y0f = floor(fy);
   let ax = fx - x0f; let ay = fy - y0f;
@@ -95,6 +118,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   if (p.use_expo == 1u) {
     var offs = p.off.xyz;
     if (p.nk > 0u) { offs += prof((fy + 0.5) / f32(p.vh), p.nk) + prof((fx + 0.5) / f32(p.vw), p.nk + p.nk * 3u); }
+    if (p.gx > 0u) { offs += local_field((fx + 0.5) / f32(p.vw), (fy + 0.5) / f32(p.vh)); }
     let cc = (col.xyz - offs) / p.gain.xyz;
     col = vec4<f32>(cc.x, cc.y, cc.z, col.w);
   }
@@ -113,6 +137,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let flags = 1u | select(0u, 2u, clean) | (min(p.mag_lv, 63u) << 2u);
   stack[o] = r | (gg << 8u) | (b << 16u) | (flags << 24u);
   stack[o + 1u] = bitcast<u32>(max(sh, 0.0));
+  stack[o + 2u] = bitcast<u32>(fwt);
 }`,
 };
 
@@ -120,7 +145,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 RENDER.median = {
   fields: [["Wc", "u32"], ["x0", "u32"], ["y0", "u32"], ["tw", "u32"], ["th", "u32"], ["K", "u32"], ["tol", "f32"], ["sharp_top", "f32"],
            ["res_lv", "u32"], ["anc_lo", "u32"], ["anc_hi", "u32"]],
-  bindings: ["r", "rw", "rw", "rw", "rw"], wg: [16, 16, 1],
+  bindings: ["r", "rw", "rw", "rw", "rw", "rw"], wg: [16, 16, 1],
   code: /* wgsl */ `
 struct P { Wc: u32, x0: u32, y0: u32, tw: u32, th: u32, K: u32, tol: f32, sharp_top: f32, res_lv: u32, anc_lo: u32, anc_hi: u32 }
 // res_lv: 許容する拡大率レベル差（255 = 無効）。anc_lo..anc_hi: アンカーフレームのスロット範囲（anc_lo > anc_hi なら無効）
@@ -130,6 +155,7 @@ struct P { Wc: u32, x0: u32, y0: u32, tw: u32, th: u32, K: u32, tol: f32, sharp_
 @group(0) @binding(3) var<storage, read_write> out_mean: array<u32>;
 @group(0) @binding(4) var<storage, read_write> out_sharp: array<u32>;
 @group(0) @binding(5) var<storage, read_write> out_cov: array<u32>;
+@group(0) @binding(6) var<storage, read_write> out_blend: array<u32>;
 
 fn chan(w0: u32, ch: u32) -> u32 { return (w0 >> (8u * ch)) & 255u; }
 fn rgb3(w0: u32) -> vec3<f32> { return vec3<f32>(f32(w0 & 255u), f32((w0 >> 8u) & 255u), f32((w0 >> 16u) & 255u)); }
@@ -192,14 +218,14 @@ fn pack(c: vec3<f32>) -> u32 {
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let x = g.x; let yy = g.y;
   if (x >= p.tw || yy >= p.th) { return; }
-  let base = (yy * p.tw + x) * 2u;
-  let stride = p.th * p.tw * 2u;
+  let base = (yy * p.tw + x) * 3u;
+  let stride = p.th * p.tw * 3u;
   let oi = (p.y0 + yy) * p.Wc + p.x0 + x;
   let zero = vec3<f32>(0.0);
   let cnt_c = count_mode(base, stride, 0u, zero, 255u, 0u);   // 被覆数（穴埋め判定用）はフィルタ前
   let cnt_g = count_mode(base, stride, 1u, zero, 255u, 0u);
   if (cnt_g == 0u) {
-    out_med[oi] = 0u; out_mean[oi] = 0u; out_sharp[oi] = 0u; out_cov[oi] = 0u; return;
+    out_med[oi] = 0u; out_mean[oi] = 0u; out_sharp[oi] = 0u; out_cov[oi] = 0u; out_blend[oi] = 0u; return;
   }
   // アンカー: 範囲内のフレームがこの画素を覆っていれば、それらだけを使う（クリーン / 幾何で別々に判定）
   let anc_c = select(0u, 1u, p.anc_lo <= p.anc_hi && count_mode(base, stride, 0u, zero, 255u, 1u) > 0u);
@@ -223,10 +249,22 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   if (ni == 0u) { imode = 3u; ilv = lvg; ianc = anc_g; ni = count_mode(base, stride, 3u, med, lvg, anc_g); }
   var mean = med;
   var sharp = med;
+  var blend = med;
   if (ni > 0u) {
     var sum = vec3<f32>(0.0);
     for (var k = 0u; k < p.K; k++) { let w0 = stack[base + k * stride]; if (ok(w0, k, imode, med, ilv, ianc)) { sum += rgb3(w0); } }
     mean = sum / f32(ni);
+    // フェザー合成: クリーン標本（無ければ幾何的標本）をフレーム端からの距離の重みで平均。中央値からのインライア判定は使わない
+    // （2 標本しか無い境界付近で片方が外れ値扱いになると、重みほぼ 0 の標本だけが残って画素ごとに供給源が切り替わる粒状ノイズが出る）
+    var fsum = vec3<f32>(0.0); var fw = 0.0;
+    for (var k = 0u; k < p.K; k++) {
+      let w0 = stack[base + k * stride];
+      if (ok(w0, k, mmode, zero, lvm, ancm)) {
+        let wf = bitcast<f32>(stack[base + k * stride + 2u]);
+        fsum += rgb3(w0) * wf; fw += wf;
+      }
+    }
+    blend = select(mean, fsum / max(fw, 1e-6), fw > 1e-6);
     // 鮮明度の上位 sharp_top（分位点 1 - sharp_top 以上）
     let kq = u32(ceil((1.0 - p.sharp_top) * f32(ni - 1u) - 1e-4));
     let thr = kth_value(base, stride, 3u, imode, med, min(kq, ni - 1u), ilv, ianc);
@@ -240,6 +278,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   out_med[oi] = pack(med);
   out_mean[oi] = pack(mean);
   out_sharp[oi] = pack(sharp);
+  out_blend[oi] = pack(blend);
   out_cov[oi] = cnt_c | (cnt_g << 16u);   // 下位 16 bit: クリーン標本数, 上位: 幾何的被覆数
 }`,
 };

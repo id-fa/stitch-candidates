@@ -103,7 +103,7 @@
     <div class="row"><label>canvas scale</label><input type="text" id="canvasScale" value="auto"><label><input type="checkbox" id="noRender"> 位置推定のみ</label></div>
     <div class="row"><label>inlier tol</label><input type="number" id="inlierTol" value="0.06" step="0.01"><label>sharp top</label><input type="number" id="sharpTop" value="0.3" step="0.05"><label>res tol</label><input type="number" id="resTol" value="1.25" step="0.05"><span class="hint">最も細部を持つ標本の拡大率 × この値以内の標本だけで合成（ズーム動画の細線保護。0 で無効）</span></div>
     <div class="row"><label>anchor frame</label><input type="number" id="anchorFrame" value="" step="1" placeholder="off"><label>± window</label><input type="number" id="anchorWindow" value="2" step="1" style="width:60px"><span class="hint">抽出後のフレーム番号。そのフレーム±window が覆う範囲はそれらだけで合成（動くキャラクターをその姿で確定）</span></div>
-    <div class="row"><label>exposure</label><select id="exposure"><option value="auto" selected>auto</option><option value="on">on</option><option value="off">off</option></select><label style="min-width:auto"><input type="checkbox" id="exposureProfile" checked> profile</label><label>min score</label><input type="number" id="exposureMinScore" value="0.2" step="0.05" style="width:60px"><span class="hint">フレーム間の明るさの違い（露出・フェード・プレイヤーの周辺グラデーション）を重なりから推定して補正。auto = 画像列では on、動画では off。profile = 全フレーム共通の周辺減光（端に密な折れ線）も推定</span></div>
+    <div class="row"><label>exposure</label><select id="exposure"><option value="auto" selected>auto</option><option value="on">on</option><option value="off">off</option></select><label style="min-width:auto"><input type="checkbox" id="exposureProfile" checked> profile</label><label>min score</label><input type="number" id="exposureMinScore" value="0.2" step="0.05" style="width:60px"><label>local</label><input type="number" id="exposureLocal" value="6" step="1" min="0" style="width:50px"><label>feather px</label><input type="number" id="feather" value="" placeholder="auto" step="10" min="0" style="width:70px"><span class="hint">フレーム間の明るさの違い（露出・フェード・プレイヤーの周辺グラデーション）を重なりから推定して補正。auto = 画像列では on、動画では off。profile = 全フレーム共通の周辺減光（端に密な折れ線）。local = フレームごとの局所オフセット場（長辺セル数、湯気・光の当たり方の違い。0 で無効）。feather = 「blend」出力でフレーム端から N px なだらかに重みを落として重ねる（空欄 = 画像列では短辺の 1/4、動画では無し）</span></div>
     <div class="row"><label>hole fill</label><select id="holeFill"><option value="inpaint" selected>inpaint</option><option value="blur">blur</option><option value="none">none</option></select><label>min clean</label><input type="number" id="minCleanCnt" value="12" step="1" style="width:60px"> 件 / <input type="number" id="minCleanPct" value="25" step="1" style="width:60px"> %<span class="hint">クリーン標本が無い、または「件数未満かつ被覆の%未満」の画素を周囲から埋める</span></div>
     <div class="row"><label>stack budget MB</label><input type="number" id="stackBudget" value="128" step="32"><label>level cache MB</label><input type="number" id="levelCache" value="768" step="128"></div>
   </fieldset>
@@ -111,7 +111,7 @@
 </div>
 <div>
   <pre id="log"></pre>
-  <div class="row" style="margin-top:8px"><span id="tabs"></span><button id="dlPng">PNG 保存</button><span id="viewInfo" class="hint"></span></div>
+  <div class="row" style="margin-top:8px"><span id="tabs"></span><button id="dlPng">PNG 保存</button><button id="denoise" title="表示中の画像に à trous ウェーブレットのノイズ除去を掛けて別タブに出します（スティッチとは独立した後処理）。しきい値は最細レベルの階調（目安 6〜12）">ノイズ除去</button><input type="number" id="denoiseThr" value="8" step="1" min="1" style="width:50px" title="しきい値（階調）"><span id="viewInfo" class="hint"></span></div>
   <div id="view"></div>
 </div>
 </div>

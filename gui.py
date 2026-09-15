@@ -1156,6 +1156,18 @@ class PanoramaTab(ttk.Frame):
         self.exposure_min_score_entry = LabeledEntry(xf, "Min score:", "0.2", width=5,
                                                      tooltip="Minimum pair match score used for exposure estimation")
         self.exposure_min_score_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.exposure_local_entry = LabeledEntry(xf, "Local grid:", "6", width=4,
+                                                 tooltip="Per-frame smooth offset field (bilinear grid, cells along the longer side) for "
+                                                         "spatially varying differences (haze, lighting). 0 = off; auto-off above 100 frames")
+        self.exposure_local_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.feather_entry = LabeledEntry(xf, "Feather px:", "", width=6,
+                                          tooltip="recon_blend.png: fade each frame's weight over N px from its edge (hides remaining "
+                                                  "brightness steps). Empty = auto (images: 1/4 of the short side, video: off), 0 = off")
+        self.feather_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.denoise_entry = LabeledEntry(xf, "Denoise thr:", "", width=5,
+                                          tooltip="Wavelet (a trous) denoise of the outputs, writes recon_*_dn.png. "
+                                                  "Threshold in levels (6-12 typical). Empty/0 = off")
+        self.denoise_entry.pack(side=tk.LEFT, padx=(12, 0))
         ttk.Label(xf, text="Brightness differences between frames (exposure, fades, player gradients) are estimated "
                            "from the overlaps. auto = on for image sequences, off for video",
                   foreground="gray").pack(side=tk.LEFT, padx=(12, 0))
@@ -1341,6 +1353,12 @@ class PanoramaTab(ttk.Frame):
         argv += ["--exposure-profile", "on" if self.exposure_profile_var.get() else "off"]
         if self.exposure_min_score_entry.get():
             argv += ["--exposure-min-score", self.exposure_min_score_entry.get()]
+        if self.exposure_local_entry.get():
+            argv += ["--exposure-local", self.exposure_local_entry.get()]
+        if self.feather_entry.get():
+            argv += ["--feather", self.feather_entry.get()]
+        if self.denoise_entry.get():
+            argv += ["--denoise", self.denoise_entry.get()]
         return argv
 
     def _run(self):

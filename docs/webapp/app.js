@@ -4,6 +4,7 @@ import { Gpu, fmtMB } from "./gpu.js";
 import { Reconstructor, DEFAULTS } from "./recon.js";
 import { render } from "./render.js";
 import { fillHoles } from "./postfx.js";
+import { denoiseRGBA } from "./denoise.js";
 import { TrimPanel } from "./trim.js";
 import { FrameStore, openVideoSource, openImageSource, isVideoFile } from "./frames.js";
 
@@ -131,6 +132,7 @@ function readArgs() {
     anchorFrame: $("anchorFrame").value.trim() === "" ? -1 : int("anchorFrame", -1), anchorWindow: int("anchorWindow", 2),
     stackBudgetMB: int("stackBudget", 128), levelCacheMB: int("levelCache", 768),
     exposure: $("exposure").value, exposureProfile: $("exposureProfile").checked, exposureMinScore: num("exposureMinScore", 0.2),
+    exposureLocal: int("exposureLocal", 6), feather: $("feather").value.trim() === "" ? -1 : num("feather", 0),
   };
 }
 
@@ -157,6 +159,31 @@ function selectTab(name) {
   for (const b of $("tabs").querySelectorAll(".tab")) b.classList.toggle("active", b.dataset.name === name);
   $("viewInfo").textContent = `${results[name].label}: ${results[name].w} x ${results[name].h}`;
   $("dlPng").onclick = () => results[name].canvas.toBlob((blob) => download(blob, `${outPrefix}${name}.png`), "image/png");
+  $("denoise").onclick = () => denoiseCurrent(name);
+}
+// 表示中の画像に à trous ウェーブレットのノイズ除去（denoise.js）を掛けて別タブに出す（スティッチとは独立した後処理）
+async function denoiseCurrent(name) {
+  if (running || !results[name]) return;
+  const thr = num("denoiseThr", 8);
+  if (!(thr > 0)) { log("[denoise] しきい値は 0 より大きい値にしてください"); return; }
+  running = true;
+  $("run").disabled = true; $("denoise").disabled = true;
+  try {
+    const g = await ensureGpu();
+    const src = results[name];
+    const rgba = src.canvas.getContext("2d").getImageData(0, 0, src.w, src.h).data;
+    const t0 = performance.now();
+    const out = await denoiseRGBA(g, rgba, src.w, src.h, thr);
+    const base = name.replace(/_dn\d*$/, "");
+    showImage(`${base}_dn`, out, src.w, src.h, `${src.label.replace(/ dn.*$/, "")} dn${thr}`);
+    log(`[denoise] ${name} → ${base}_dn: à trous wavelet thr=${thr}, ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    log(`[error] denoise: ${e.message || e}`);
+    console.error(e);
+  } finally {
+    running = false;
+    $("run").disabled = !!gpuError; $("denoise").disabled = false;
+  }
 }
 function download(blob, filename) {
   const a = document.createElement("a");
@@ -236,6 +263,9 @@ async function run() {
       if (rc.exposure) { const ecsv = rc.exposureCsv(); csvButton("dlExposure", `${outPrefix}exposure.csv`, ecsv); window.__last.exposure = ecsv; }
     }
     if (!$("noRender").checked) {
+      // フェザー幅: 空欄 = auto（画像列ではフレーム短辺の 1/4、動画では 0 = 出力しない）
+      if (args.feather < 0) args.feather = isVideo ? 0 : 0.25 * Math.min(src.W, src.H);
+      rc.a.feather = args.feather;
       const res = await render(rc, al);
       if (args.holeFill !== "none") {
         // 幾何的には覆われているがクリーン標本が無い画素（テロップが常に載っていた場所）を埋める
@@ -249,11 +279,12 @@ async function run() {
         }
         const t0 = performance.now();
         let nfill = 0;
-        for (const img of [res.median, res.mean, res.sharp]) nfill = fillHoles(img, fill, res.Wc, res.Hc, args.holeFill);
+        for (const img of [res.median, res.mean, res.sharp, res.blend]) if (img) nfill = fillHoles(img, fill, res.Wc, res.Hc, args.holeFill);
         log(`[postfx] hole fill (${args.holeFill}): ${nfill} px, ${((performance.now() - t0) / 1000).toFixed(1)}s`);
       }
       showImage("recon_mean", res.mean, res.Wc, res.Hc, "mean");
       showImage("recon_sharp", res.sharp, res.Wc, res.Hc, "sharp");
+      if (res.blend) showImage("recon_blend", res.blend, res.Wc, res.Hc, "blend");
       let cmax = 1;
       for (const v of res.coverage) if (v > cmax) cmax = v;
       const cov = new Uint8ClampedArray(res.Wc * res.Hc * 4);

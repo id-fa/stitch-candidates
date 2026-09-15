@@ -913,8 +913,29 @@ class Reconstructor:
             By = self._hat((fy + 0.5) / hk, knots)                                  # (..., K)
             Bx = self._hat((fx + 0.5) / wk, knots)
             out = out + (By @ fy_ + Bx @ fx_).movedim(-1, 0)
+        if e["local"] is not None:
+            # フレームごとの局所オフセット場（双一次格子）
+            Gx, Gy = e["local_grid"]
+            Fk = torch.from_numpy(e["local"][k]).to(fx.device, torch.float32)       # ((Gx+1)*(Gy+1), 3)
+            idx, wgt = self._grid_basis((fx + 0.5) / wk, (fy + 0.5) / hk, Gx, Gy)  # (..., 4)
+            out = out + (Fk[idx] * wgt[..., None]).sum(-2).movedim(-1, 0)
         invg = torch.from_numpy(1.0 / e["gain"][k]).to(fx.device, torch.float32)
         return out, invg[:, None, None]
+
+    @staticmethod
+    def _grid_basis(xn: torch.Tensor, yn: torch.Tensor, Gx: int, Gy: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """正規化座標 (0..1) → 双一次格子 (Gx+1)×(Gy+1) の節点インデックス (..., 4) と重み (..., 4)"""
+        u = (xn.clamp(0.0, 1.0) * Gx)
+        v = (yn.clamp(0.0, 1.0) * Gy)
+        q0 = u.floor().clamp(0, Gx - 1)
+        r0 = v.floor().clamp(0, Gy - 1)
+        fu = (u - q0).clamp(0.0, 1.0)
+        fv = (v - r0).clamp(0.0, 1.0)
+        q0l, r0l = q0.long(), r0.long()
+        base = r0l * (Gx + 1) + q0l
+        idx = torch.stack([base, base + 1, base + Gx + 1, base + Gx + 2], dim=-1)
+        wgt = torch.stack([(1 - fu) * (1 - fv), fu * (1 - fv), (1 - fu) * fv, fu * fv], dim=-1)
+        return idx, wgt
 
     def estimate_exposure(self, pairs: List[Tuple[int, int]], pp: np.ndarray, sc: np.ndarray,
                           out_dir: Optional[Path] = None) -> None:
@@ -1001,8 +1022,20 @@ class Reconstructor:
         xnj, ynj = torch.cat([o[6] for o in obs]), torch.cat([o[7] for o in obs])
         w0 = torch.cat([o[8] for o in obs])
         N = Mi.shape[0]
-        # 未知数: [δg_0..δg_{n-1}, a_0..a_{n-1}, f_0..f_{K-1}, g_0..g_{K-1}]（チャンネル別に解く）
-        P = 2 * n + 2 * K
+        # 局所オフセット場: フレームごとの双一次格子（長辺 --exposure-local セル）。フレーム数が多いと未知数が増えすぎるので上限あり
+        Gx = Gy = 0
+        if int(a.exposure_local) > 0:
+            if n > 100:
+                log(f"[exposure] フレーム数 {n} > 100 のため局所オフセット場は使いません（--exposure-local 0 と同じ）")
+            else:
+                Gl = int(a.exposure_local)
+                if W >= H:
+                    Gx, Gy = Gl, max(1, int(round(Gl * H / W)))
+                else:
+                    Gy, Gx = Gl, max(1, int(round(Gl * W / H)))
+        NG = (Gx + 1) * (Gy + 1) if Gx > 0 else 0
+        # 未知数: [δg_0..δg_{n-1}, a_0..a_{n-1}, f_0..f_{K-1}, g_0..g_{K-1}, F_0 (NG), ..., F_{n-1} (NG)]（チャンネル別に解く）
+        P = 2 * n + 2 * K + n * NG
         d = Mi - Mj                                   # (N, 3)
         Lbar = 0.5 * (Mi + Mj)                        # (N, 3)
         # 位置に依らない部分の疎な行: 列と値（チャンネル共通）
@@ -1020,6 +1053,13 @@ class Reconstructor:
             hat2(ynj, 2 * n, -1.0)
             hat2(xni, 2 * n + K, 1.0)
             hat2(xnj, 2 * n + K, -1.0)
+        if NG > 0:
+            baseF = 2 * n + 2 * K
+            for (xn_, yn_, fk, sign) in ((xni, yni, fi, 1.0), (xnj, ynj, fj, -1.0)):
+                idx, wgt = self._grid_basis(xn_, yn_, Gx, Gy)                 # (N, 4)
+                for q in range(4):
+                    cols_c.append(baseF + fk * NG + idx[:, q])
+                    vals_c.append(sign * wgt[:, q])
         cols_common = torch.stack(cols_c, 1)          # (N, Q)
         vals_common = torch.stack(vals_c, 1)
         # 正則化
@@ -1046,6 +1086,23 @@ class Reconstructor:
                     row *= 0.5 * (h1 + h2)
                     smooth += row[:, None] * row[None, :]
             smooth *= 1e-2 * N / K
+        if NG > 0:
+            # 局所場: 0 へのリッジ（観測の無い節点は補正しない）と隣接節点の差の平滑化。定数成分は a_k と重なるが、リッジで a_k 側に寄る
+            baseF = 2 * n + 2 * K
+            reg[baseF:] = 1e-3 * N / n
+            lam_l = 3e-2 * N / n
+            for k in range(n):
+                b0 = baseF + k * NG
+                for r in range(Gy + 1):
+                    for q in range(Gx + 1):
+                        p = b0 + r * (Gx + 1) + q
+                        for pn in ((p + 1) if q < Gx else None, (p + Gx + 1) if r < Gy else None):
+                            if pn is None:
+                                continue
+                            smooth[p, p] += lam_l
+                            smooth[pn, pn] += lam_l
+                            smooth[p, pn] -= lam_l
+                            smooth[pn, p] -= lam_l
         cthr = 0.03                                   # Cauchy スケール（0..1 単位 ≈ 8 階調）
         theta = torch.zeros((P, 3), dtype=torch.float64, device=dev)
         res = d.clone()
@@ -1072,8 +1129,9 @@ class Reconstructor:
             res[:, ch] = r
         gain = (1.0 + theta[:n]).cpu().numpy()                        # (n, 3)
         offset = theta[n:2 * n].cpu().numpy()                          # (n, 3) 0..1 単位
-        profile = (theta[2 * n:2 * n + K].cpu().numpy(), theta[2 * n + K:].cpu().numpy()) if use_profile else None
-        self.exposure = {"gain": gain, "offset": offset, "profile": profile}
+        profile = (theta[2 * n:2 * n + K].cpu().numpy(), theta[2 * n + K:2 * n + 2 * K].cpu().numpy()) if use_profile else None
+        local = theta[2 * n + 2 * K:].reshape(n, NG, 3).cpu().numpy() if NG > 0 else None
+        self.exposure = {"gain": gain, "offset": offset, "profile": profile, "local": local, "local_grid": (Gx, Gy)}
         mad0 = float(d.abs().mean(1).median()) * 255.0
         mad1 = float(res.abs().mean(1).median()) * 255.0
         msg = (f"[exposure] {n_pairs_used} pairs, {N} blocks, 重なりの差（中央値）{mad0:.2f} → {mad1:.2f} 階調, "
@@ -1081,6 +1139,9 @@ class Reconstructor:
         if profile is not None:
             py, px = profile[0].mean(1) * 255.0, profile[1].mean(1) * 255.0
             msg += f", profile y {py.min():+.1f}..{py.max():+.1f} / x {px.min():+.1f}..{px.max():+.1f} 階調"
+        if local is not None:
+            lm = local.mean(2) * 255.0
+            msg += f", local field ({Gx}x{Gy} cells) {lm.min():+.1f}..{lm.max():+.1f} 階調"
         log(msg + f", {time.time() - t0:.1f}s")
         if out_dir is not None:
             with open(out_dir / "exposure.csv", "w", newline="", encoding="utf-8") as f:
@@ -1094,6 +1155,13 @@ class Reconstructor:
                     for q in range(K):
                         wr.writerow([f"{self.EXPO_KNOTS[q]:.2f}"] + [f"{v * 255:.2f}" for v in profile[0][q]] +
                                     [f"{v * 255:.2f}" for v in profile[1][q]])
+                if local is not None:
+                    wr.writerow([])
+                    wr.writerow(["local_frame", "knot_x", "knot_y", "r", "g", "b"])
+                    for k in range(n):
+                        for r in range(Gy + 1):
+                            for q in range(Gx + 1):
+                                wr.writerow([k, q, r] + [f"{v * 255:.2f}" for v in local[k][r * (Gx + 1) + q]])
             if os.environ.get("PANORAMA_EXPOSURE_DEBUG"):
                 with open(out_dir / "exposure_obs.csv", "w", newline="", encoding="utf-8") as f:
                     wr = csv.writer(f)
@@ -1126,6 +1194,8 @@ class Reconstructor:
         out_med = np.zeros((Hc, Wc, 3), dtype=np.uint8)
         out_sharp = np.zeros((Hc, Wc, 3), dtype=np.uint8)
         out_mean = np.zeros((Hc, Wc, 3), dtype=np.uint8)
+        feather = float(a.feather)
+        out_blend = np.zeros((Hc, Wc, 3), dtype=np.uint8) if feather > 0 else None
         coverage = np.zeros((Hc, Wc), dtype=np.uint16)
         coverage_g = np.zeros((Hc, Wc), dtype=np.uint16)
         holes = 0
@@ -1136,7 +1206,7 @@ class Reconstructor:
             y1 = min(Hc, y0 + a.band)
             bh = y1 - y0
             ks = [k for k in range(n) if boxes[k][:, 1].min() < y1 and boxes[k][:, 1].max() > y0]
-            vals, aux = [], []
+            vals, aux, fw = [], [], []
             ys = torch.arange(y0, y1, device=dev, dtype=torch.float32)
             Xg, Yg = torch.meshgrid(xs_all, ys, indexing="xy")  # (bh, Wc)
             for k in ks:
@@ -1163,6 +1233,11 @@ class Reconstructor:
                     smp = (smp - off) * invg
                 vals.append(smp)
                 aux.append(F.grid_sample(ax, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0])
+                if feather > 0:
+                    # フェザー重み: フレームの有効領域の端からの距離（フレーム px）を feather で飽和
+                    hk, wk = self.sizes[k]
+                    dist_e = torch.minimum(torch.minimum(fx, wk - 1 - fx), torch.minimum(fy, hk - 1 - fy))
+                    fw.append((dist_e / feather).clamp(0.0, 1.0))
             if not ks:
                 holes += bh * Wc
                 continue
@@ -1221,12 +1296,24 @@ class Reconstructor:
                 return (t.clamp(0, 1) * 255.0 + 0.5).byte().permute(1, 2, 0).cpu().numpy()
             out_med[y0:y1] = to_u8(med)
             out_mean[y0:y1] = to_u8(mean)
+            if out_blend is not None:
+                # フェザー合成: クリーン標本をフレーム端からの距離で重み付けして平均（境界の明るさの段差をなだらかにする）。
+                # 中央値からのインライア判定は使わない: 2 標本しか無い境界付近で片方が外れ値扱いになると、重みがほぼ 0 の
+                # 標本だけが残って正規化で全重みになり、画素ごとに供給源が切り替わる粒状ノイズが出る
+                Fw = torch.stack(fw) * C.float()
+                sw = Fw.sum(0)
+                blend = (V * Fw[:, None]).sum(0) / sw.clamp(min=1e-6)[None]
+                blend = torch.where((sw > 1e-6)[None], blend, mean)
+                out_blend[y0:y1] = to_u8(blend)
             out_sharp[y0:y1] = to_u8(sharp)
             coverage[y0:y1] = cnt_c.cpu().numpy().astype(np.uint16)
             coverage_g[y0:y1] = cnt_g.cpu().numpy().astype(np.uint16)
         fallback = int(((coverage_g > 0) & (coverage == 0)).sum())
         log(f"[render] done {time.time() - t0:.1f}s, uncovered px={holes}, fallback (no clean sample) px={fallback}")
-        return {"median": out_med, "sharp": out_sharp, "mean": out_mean, "coverage": coverage, "coverage_geom": coverage_g}
+        res = {"median": out_med, "sharp": out_sharp, "mean": out_mean, "coverage": coverage, "coverage_geom": coverage_g}
+        if out_blend is not None:
+            res["blend"] = out_blend
+        return res
 
     # ---- 後処理: クリーン標本の無い/少ない画素の穴埋め ----
     def fill_holes(self, res: Dict[str, np.ndarray]) -> int:
@@ -1242,7 +1329,9 @@ class Reconstructor:
         if n == 0 or a.hole_fill == "none":
             return 0
         fill_t = torch.from_numpy(fill).to(self.dev)
-        for key in ("median", "mean", "sharp"):
+        for key in ("median", "mean", "sharp", "blend"):
+            if key not in res:
+                continue
             img = torch.from_numpy(res[key]).to(self.dev).permute(2, 0, 1).float()  # 3,H,W
             if a.hole_fill == "blur":
                 b = box_blur(box_blur(img, 2 * 8 + 1), 2 * 8 + 1)
@@ -1337,6 +1426,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "off ならフレームごとのゲインとオフセットのみ")
     ex.add_argument("--exposure-min-score", type=float, default=0.2,
                     help="露出推定に使うペアの最小マッチスコア（default: 0.2）")
+    ex.add_argument("--exposure-local", type=int, default=6,
+                    help="フレームごとの局所オフセット場（双一次格子）の長辺セル数。湯気・光の当たり方など位置によって違う明るさの差を"
+                         "重なりから推定して補正する。0 で無効（default: 6。フレーム数 > 100 では自動的に無効）")
+    ex.add_argument("--denoise", type=float, default=0.0,
+                    help="出力画像に à trous ウェーブレットのノイズ除去（wavelet_denoise.py）を掛けて *_dn.png も出力する。"
+                         "値は最細レベルのしきい値（階調、目安 6-12）。0 で無効（default: 0）")
+    ex.add_argument("--feather", type=float, default=-1.0,
+                    help="recon_blend.png: 各フレームの端から N px でなだらかに重みを落として重ね合わせる（露出補正後に残る差を"
+                         "境界でぼかす）。0 で出力しない、-1 = auto（画像列ではフレーム短辺の 1/4、動画では 0）")
 
     rd = ap.add_argument_group("合成")
     rd.add_argument("--canvas-scale", type=str, default="auto",
@@ -1400,6 +1498,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         log(f"[load] サイズの異なる画像を {frames[0].shape[1]}x{frames[0].shape[0]} に揃えました（右・下を端の画素で埋め、"
             f"合成には使いません）: " + ", ".join(f"{w}x{h}" for h, w in uniq))
     exposure_on = a.exposure == "on" or (a.exposure == "auto" and not a.video)
+    if a.feather < 0:
+        a.feather = 0.0 if a.video else 0.25 * min(frames[0].shape[0], frames[0].shape[1])
 
     out_dir = Path(a.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1431,6 +1531,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         Image.fromarray(res["median"]).save(out_dir / "recon_median.png")
         Image.fromarray(res["sharp"]).save(out_dir / "recon_sharp.png")
         Image.fromarray(res["mean"]).save(out_dir / "recon_mean.png")
+        if "blend" in res:
+            Image.fromarray(res["blend"]).save(out_dir / "recon_blend.png")
+            log(f"[output] {out_dir / 'recon_blend.png'} (feather {a.feather:.0f} px)")
+        if a.denoise > 0:
+            from wavelet_denoise import denoise_rgb
+            t_dn = time.time()
+            for key in ("median", "mean", "sharp", "blend"):
+                if key in res:
+                    Image.fromarray(denoise_rgb(res[key], thr=a.denoise)).save(out_dir / f"recon_{key}_dn.png")
+            log(f"[denoise] à trous wavelet thr={a.denoise:g} → recon_*_dn.png, {time.time() - t_dn:.1f}s")
         cov = res["coverage"].astype(np.float32)
         cov = (255.0 * np.clip(cov / max(1.0, float(cov.max())), 0, 1)).astype(np.uint8)
         Image.fromarray(cov).save(out_dir / "coverage.png")

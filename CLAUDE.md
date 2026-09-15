@@ -241,6 +241,26 @@ python panorama_recon.py --video input.mp4 --model translation --out pano_out
   stronger than the one on the profile and the solver puts such a ramp into the shared profile (offsets ±6 levels, profile +13..-16);
   with the opposite choice the mosaic got an exaggerated 80-level wall gradient. Seams at coverage transitions are ≤ 1.4 levels after
   correction.
+- Strong exposure differences between screenshots (added 2026-09-16, `sample_image3/` = bathhouse with steam: image 1 is a washed-out
+  fade, the haze also differs spatially between images, so a global gain/offset per frame leaves 5-10 level steps):
+  - `--exposure-local N` (default 6, GUI "Local grid", Web "local"): per-frame smooth offset field F_k on a bilinear grid with N cells
+    along the longer side (6x3 for 16:9), added to the exposure model and solved jointly (ridge to 0 so unobserved cells stay
+    uncorrected, first-difference smoothness). Only for n ≤ 100 frames (dense solve); 0 disables. `exposure.csv` lists the knots.
+  - `--feather PX` (default -1 = auto: images → short side / 4, video → 0; GUI "Feather px", Web "feather px"): extra output
+    `recon_blend.png` (Web tab "blend") = inlier samples averaged with weight min(1, distance to the frame's valid edge / PX), so the
+    brightness transition is spread over the overlap instead of a step at the coverage boundary. Web: the sample stack is now 3 words
+    (rgb+flags, sharpness, feather weight), so stack memory per sample is 12 B.
+  - Result on sample_image3: overlap difference 21.7 → 5.4 levels with the local field; recon_blend hides the remaining steps.
+  - Blend weighting uses *clean* samples, not the median inliers: with 2 samples at a coverage boundary, rejecting one as an
+    outlier leaves the near-zero-weight sample as the sole contributor after normalisation, and pixels flip between sources
+    (a speckle band along the boundary was visible in the first version).
+  - `wavelet_denoise.py` (added 2026-09-16): standalone à trous / starlet (undecimated B3-spline) wavelet shrinkage for the
+    outputs, `python wavelet_denoise.py in.png out.png --thr 8`. The threshold is given directly in levels at the finest scale
+    (coarser levels scaled by the B3 noise propagation 0.889, 0.200, 0.086, 0.041) because MAD-based sigma estimation returns
+    ~0 on flat anime fills. Undecimated → no blocking/ringing; outlines (large coefficients) survive. `--denoise THR` in
+    panorama_recon writes `recon_*_dn.png` (GUI "Denoise thr"); the Web version has a "ノイズ除去" button on the result view
+    (`denoise.js`, WGSL, applies to the shown tab → `<name>_dn` tab).
+    sample_image1/2: 1.42 → 1.20 and 1.64 → 0.95 levels. Video default output unchanged (byte-identical).
 - Few-frame robustness (added 2026-09-16, both versions): pairs with offset > the smallest `--pairs` offset (k=2,4) have no overlap
   when only 5 screenshots are given, yet masked NCC can still return a high score on smooth contours (Web 1/16 level gave 0.77 for
   (0,2) in `sample_image2`). That pulled the coarse global solve away from the correct chain and the fine step was then initialised

@@ -10,7 +10,7 @@ export const DEFAULTS = {
   scaleMax: 0.06, scaleStep: 0.004, fineScale: 1.0, gnIters: 15, ignoreRects: [], textRects: [],
   staticMask: true, staticSpan: 6, staticDiff: 0.03, staticGrad: 0.08, staticDilate: 7, staticHalo: 12, staticClose: 3, textHalo: 4,
   canvasScale: "auto", band: 64, inlierTol: 0.06, sharpTop: 0.3, resTol: 1.25, anchorFrame: -1, anchorWindow: 2, stackBudgetMB: 128, levelCacheMB: 768,
-  exposureProfile: true, exposureMinScore: 0.2,
+  exposureProfile: true, exposureMinScore: 0.2, exposureLocal: 6, feather: 0,
 };
 
 // 露出補正プロファイルの節点（正規化座標 0..1）。プレイヤーのグラデーション等は端で急に変わるので端に密に置く
@@ -745,8 +745,24 @@ export class Reconstructor {
     }
     const N = obs.i.length;
     if (N === 0) { this.log("[exposure] 重なりの観測が得られないため露出補正を行いません"); return; }
-    // 未知数 [δg_0..δg_{n-1}, a_0..a_{n-1}, f_0..f_{NK-1}, g_0..g_{NK-1}]。観測ごとの疎な行（最大 12 要素）
-    const P = 2 * n + 2 * NK, Q = 4 + 4 * NK * 0 + (NK ? 8 : 0);
+    // 局所オフセット場: フレームごとの双一次格子（長辺 exposureLocal セル）。フレーム数が多いと未知数が増えすぎるので上限あり
+    let Gx = 0, Gy = 0;
+    const Gl = a.exposureLocal | 0;
+    if (Gl > 0) {
+      if (n > 100) this.log(`[exposure] フレーム数 ${n} > 100 のため局所オフセット場は使いません（local 0 と同じ）`);
+      else if (W >= H) { Gx = Gl; Gy = Math.max(1, Math.round(Gl * H / W)); }
+      else { Gy = Gl; Gx = Math.max(1, Math.round(Gl * W / H)); }
+    }
+    const NG = Gx > 0 ? (Gx + 1) * (Gy + 1) : 0;
+    const gridBasis = (xn, yn) => {   // → [idx0..3, w0..3]
+      const u = Math.min(1, Math.max(0, xn)) * Gx, v = Math.min(1, Math.max(0, yn)) * Gy;
+      const q0 = Math.min(Gx - 1, Math.floor(u)), r0 = Math.min(Gy - 1, Math.floor(v));
+      const fu = Math.min(1, Math.max(0, u - q0)), fv = Math.min(1, Math.max(0, v - r0));
+      const b = r0 * (Gx + 1) + q0;
+      return [[b, b + 1, b + Gx + 1, b + Gx + 2], [(1 - fu) * (1 - fv), fu * (1 - fv), (1 - fu) * fv, fu * fv]];
+    };
+    // 未知数 [δg(n), a(n), f(NK), g(NK), F_0(NG) .. F_{n-1}(NG)]。観測ごとの疎な行（最大 20 要素）
+    const P = 2 * n + 2 * NK + n * NG, Q = 4 + (NK ? 8 : 0) + (NG ? 8 : 0);
     const cols = new Int32Array(N * Q), vals = new Float64Array(N * Q);
     const hat = (t) => {
       t = Math.min(1, Math.max(0, t));
@@ -766,6 +782,14 @@ export class Reconstructor {
         cols[b + 8] = 2 * n + NK + pi; vals[b + 8] = 1 - gi; cols[b + 9] = 2 * n + NK + pi + 1; vals[b + 9] = gi;
         cols[b + 10] = 2 * n + NK + pj; vals[b + 10] = -(1 - gj); cols[b + 11] = 2 * n + NK + pj + 1; vals[b + 11] = -gj;
       }
+      if (NG) {
+        const b2 = b + (NK ? 12 : 4), baseF = 2 * n + 2 * NK;
+        const [ii, wi] = gridBasis(obs.xi[o], obs.yi[o]), [ij, wj] = gridBasis(obs.xj[o], obs.yj[o]);
+        for (let q = 0; q < 4; q++) {
+          cols[b2 + q] = baseF + i * NG + ii[q]; vals[b2 + q] = wi[q];
+          cols[b2 + 4 + q] = baseF + j * NG + ij[q]; vals[b2 + 4 + q] = -wj[q];
+        }
+      }
     }
     // 正則化: ゲインは 1 へ、プロファイルは 0 と滑らかさへ（弱く）、Σ δg = Σ a = 0（ゲージ）
     const reg = new Float64Array(P);
@@ -780,6 +804,21 @@ export class Reconstructor {
           const h1 = knots[t + 1] - knots[t], h2 = knots[t + 2] - knots[t + 1], sc = 0.5 * (h1 + h2);
           const row = [[base + t, sc / h1], [base + t + 1, -sc * (1 / h1 + 1 / h2)], [base + t + 2, sc / h2]];
           for (const [p, vp] of row) for (const [q, vq] of row) fixed[p * P + q] += vp * vq * 1e-2 * N / NK;
+        }
+      }
+    }
+    if (NG) {
+      // 局所場: 0 へのリッジ（観測の無い節点は補正しない）と隣接節点の差の平滑化（Python 版と同じ）
+      const baseF = 2 * n + 2 * NK, lamL = 3e-2 * N / n;
+      for (let q = baseF; q < P; q++) reg[q] = 1e-3 * N / n;
+      for (let k = 0; k < n; k++) {
+        const b0 = baseF + k * NG;
+        for (let r = 0; r <= Gy; r++) for (let q = 0; q <= Gx; q++) {
+          const p = b0 + r * (Gx + 1) + q;
+          for (const pn of [q < Gx ? p + 1 : -1, r < Gy ? p + Gx + 1 : -1]) {
+            if (pn < 0) continue;
+            fixed[p * P + p] += lamL; fixed[pn * P + pn] += lamL; fixed[p * P + pn] -= lamL; fixed[pn * P + p] -= lamL;
+          }
         }
       }
     }
@@ -821,9 +860,10 @@ export class Reconstructor {
     for (let k = 0; k < n; k++) for (let c = 0; c < 3; c++) { gain[k * 3 + c] = 1 + theta[k * 3 + c]; offset[k * 3 + c] = theta[(n + k) * 3 + c]; }
     let profile = null;
     if (NK) {
-      profile = { fy: theta.slice(2 * n * 3, (2 * n + NK) * 3), gx: theta.slice((2 * n + NK) * 3, P * 3) };
+      profile = { fy: theta.slice(2 * n * 3, (2 * n + NK) * 3), gx: theta.slice((2 * n + NK) * 3, (2 * n + 2 * NK) * 3) };
     }
-    this.exposure = { gain, offset, profile, knots };
+    const local = NG ? theta.slice((2 * n + 2 * NK) * 3, P * 3) : null;   // n × NG × 3（0..1 単位）
+    this.exposure = { gain, offset, profile, knots, local, localGrid: [Gx, Gy] };
     const absmean = (arr) => { const out = new Float64Array(N); for (let o = 0; o < N; o++) out[o] = (Math.abs(arr[o * 3]) + Math.abs(arr[o * 3 + 1]) + Math.abs(arr[o * 3 + 2])) / 3; return out; };
     const mad0 = median(absmean(d)) * 255, mad1 = median(absmean(res)) * 255;
     let msg = `[exposure] ${nPairs} pairs, ${N} blocks, 重なりの差（中央値）${mad0.toFixed(2)} → ${mad1.toFixed(2)} 階調, ` +
@@ -832,6 +872,11 @@ export class Reconstructor {
       const lum = (arr) => Array.from({ length: NK }, (_, q) => (arr[q * 3] + arr[q * 3 + 1] + arr[q * 3 + 2]) / 3 * 255);
       const py = lum(profile.fy), px = lum(profile.gx);
       msg += `, profile y ${Math.min(...py).toFixed(1)}..${Math.max(...py).toFixed(1)} / x ${Math.min(...px).toFixed(1)}..${Math.max(...px).toFixed(1)} 階調`;
+    }
+    if (local) {
+      let lmin = Infinity, lmax = -Infinity;
+      for (let q = 0; q < n * NG; q++) { const v = (local[q * 3] + local[q * 3 + 1] + local[q * 3 + 2]) / 3 * 255; lmin = Math.min(lmin, v); lmax = Math.max(lmax, v); }
+      msg += `, local field (${Gx}x${Gy} cells) ${lmin.toFixed(1)}..${lmax.toFixed(1)} 階調`;
     }
     this.log(`${msg}, ${(now() - t0).toFixed(1)}s`);
     this.progress("exposure", 1);
@@ -850,6 +895,14 @@ export class Reconstructor {
       for (let q = 0; q < e.knots.length; q++) {
         s += `${e.knots[q].toFixed(2)},${[0, 1, 2].map((c) => (e.profile.fy[q * 3 + c] * 255).toFixed(2)).join(",")},` +
              `${[0, 1, 2].map((c) => (e.profile.gx[q * 3 + c] * 255).toFixed(2)).join(",")}\n`;
+      }
+    }
+    if (e.local) {
+      const [Gx, Gy] = e.localGrid, NG = (Gx + 1) * (Gy + 1);
+      s += "\nlocal_frame,knot_x,knot_y,r,g,b\n";
+      for (let k = 0; k < this.n; k++) for (let r = 0; r <= Gy; r++) for (let q = 0; q <= Gx; q++) {
+        const o = (k * NG + r * (Gx + 1) + q) * 3;
+        s += `${k},${q},${r},${[0, 1, 2].map((c) => (e.local[o + c] * 255).toFixed(2)).join(",")}\n`;
       }
     }
     return s;
