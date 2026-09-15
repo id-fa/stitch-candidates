@@ -223,6 +223,35 @@ python panorama_recon.py --video input.mp4 --model translation --out pano_out
   mask still thin lines near the zoom centre: disable it or raise `--static-span` when there is no telop.
 - If a static logo sits at a canvas edge covered only by frames where it is masked, the render falls back to the
   unmasked median there (logo remains). `coverage.png` shows such regions as dark.
+- Still images of different sizes (added 2026-09-16, e.g. `sample_image1/` = 5 clipboard screenshots 1920x939..1080): frames are
+  padded to the largest size (`pad_to_common_size`, right/bottom filled by edge replication so the high-pass has no border response)
+  and each frame keeps its valid size in `Reconstructor.sizes`. The padded area is masked for alignment, excluded from the static
+  test, and treated as geometrically invalid in the render (canvas bounds use the valid corners). Web version: same in
+  `frames.js` `openImageSource` (sizes read from PNG/JPEG headers, no stretching), `store.sizes`, `static_detect` / `finalize_mask` /
+  `warp` take the valid size.
+- Exposure compensation (added 2026-09-16, `--exposure auto|on|off`, auto = on for `--frames`, off for `--video`; GUI "Exposure",
+  Web "exposure"): screenshots of the same scene can differ in brightness. In `sample_image1` the difference is *additive* (same
+  offset for dark and bright pixels, so a log-gain model does not fit) and comes from a top/bottom gradient fixed to the frame
+  (edges about 10 levels darker than the centre) plus a per-image trend. Model: I_k = g_k L + a_k + f(y/h_k) + g(x/w_k) with
+  per-frame gain/offset (per channel) and a shared additive profile f, g (piecewise linear, knots dense near the edges,
+  `--exposure-profile on|off`). Observations are 32 px block means of clean pixels in each aligned pair (`--exposure-min-score`),
+  solved by IRLS (Cauchy 8 levels) with gauges Σa=0, Σ(g-1)=0, ridge on g towards 1 and smoothness on the profile. Applied in the
+  render before the median. Gauge note: a ramp fixed to the frame is indistinguishable from per-frame constants when the frames are
+  evenly spaced (`sample_image2/`: differences proportional to the shift, ~0.03 levels/px), so the ridge on the per-frame offsets is
+  stronger than the one on the profile and the solver puts such a ramp into the shared profile (offsets ±6 levels, profile +13..-16);
+  with the opposite choice the mosaic got an exaggerated 80-level wall gradient. Seams at coverage transitions are ≤ 1.4 levels after
+  correction.
+- Few-frame robustness (added 2026-09-16, both versions): pairs with offset > the smallest `--pairs` offset (k=2,4) have no overlap
+  when only 5 screenshots are given, yet masked NCC can still return a high score on smooth contours (Web 1/16 level gave 0.77 for
+  (0,2) in `sample_image2`). That pulled the coarse global solve away from the correct chain and the fine step was then initialised
+  from the wrong prediction. Now the coarse global solve is first done with the smallest-offset chain only; far pairs whose coarse
+  estimate disagrees with it by more than max(32 px, 8 px per hop at full res) get weight ×1e-3 (log `far pairs inconsistent with
+  chain=N`). They are later dropped by the GN (n_valid < 2%). Video results are unchanged (byte-identical on sample.mp4).
+  The Web coarse search additionally lifts the top 4 local peaks of the 1/16 surface to the 1/4 window search (`_search16Peaks`)
+  instead of only the argmax; `window.__dbgCoarse = true` logs every candidate. Log line `[exposure] ... 重なりの差（中央値） 4.60 → 1.42 階調`; `exposure.csv` holds per-frame gains/offsets
+  and the profile; `PANORAMA_EXPOSURE_DEBUG=1` also dumps the block observations. Video output with the default (off) is byte-identical
+  to before. The Web version implements the same estimator on the CPU (`recon.js` `estimateExposure`, cell statistics from the
+  `cell_rgba` kernel) and applies it in the `warp` shader; results match the Python version to ~1 level.
 
 ---
 

@@ -54,6 +54,8 @@ export class FrameStore {
   constructor(gpu, src, opts) {
     this.gpu = gpu; this.src = src; this.log = opts.log || (() => {});
     this.n = src.n; this.W = src.W; this.H = src.H;
+    // 各フレームの有効サイズ [w, h]（画像列でサイズが異なる場合の左上詰め。動画は全て W x H）
+    this.sizes = src.sizes || Array.from({ length: this.n }, () => [this.W, this.H]);
     this.frameBytes = this.W * this.H * 4;
     this.maskBytes = Math.ceil(this.W * this.H / 32) * 4;
     this.maxResident = Math.max(1, Math.min(this.n, opts.maxResident | 0 || this.n));
@@ -203,22 +205,70 @@ export async function openVideoSource(file, opts, log) {
 
 const naturalKey = (s) => s.split(/(\d+)/).map((t) => (/^\d+$/.test(t) ? t.padStart(12, "0") : t.toLowerCase())).join("");
 
-/** 画像列の供給元。opts: {every, maxFrames, inputScale} */
+/** 画像ファイルの (幅, 高さ)。PNG / JPEG はヘッダから読む（デコード不要）。それ以外は createImageBitmap */
+async function imageSize(file) {
+  const head = new Uint8Array(await file.slice(0, 1 << 20).arrayBuffer());
+  if (head.length > 24 && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) {
+    const dv = new DataView(head.buffer);
+    return [dv.getUint32(16), dv.getUint32(20)];
+  }
+  if (head.length > 4 && head[0] === 0xff && head[1] === 0xd8) {
+    let p = 2;
+    while (p + 9 < head.length) {
+      if (head[p] !== 0xff) { p++; continue; }
+      const m = head[p + 1];
+      if (m === 0xff) { p++; continue; }                                     // fill byte
+      if (m === 0xd8 || m === 0x01 || (m >= 0xd0 && m <= 0xd7)) { p += 2; continue; }   // 長さ無しのマーカー
+      const len = (head[p + 2] << 8) | head[p + 3];
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {   // SOFn
+        return [(head[p + 7] << 8) | head[p + 8], (head[p + 5] << 8) | head[p + 6]];
+      }
+      p += 2 + len;
+    }
+  }
+  const bmp = await createImageBitmap(file);
+  const s = [bmp.width, bmp.height];
+  bmp.close();
+  return s;
+}
+
+/**
+ * 画像列の供給元。opts: {every, maxFrames, inputScale}
+ * サイズの異なる画像（スクリーンショット等）は引き伸ばさず、最大サイズのキャンバスに左上詰めで置き、右・下は端の画素を
+ * 複製して埋める（ハイパス等の境界応答を抑えるため）。各フレームの有効サイズは sizes[k] = [w, h] で返し、
+ * 複製領域は位置合わせ・合成の両方から除外される（Python 版 pad_to_common_size と同じ）
+ */
 export async function openImageSource(files, opts, log) {
   const list = [...files].sort((a, b) => (naturalKey(a.name) < naturalKey(b.name) ? -1 : 1));
   const sel = list.filter((_, i) => i % opts.every === 0).slice(0, opts.maxFrames > 0 ? opts.maxFrames : undefined);
   if (!sel.length) throw new Error("画像がありません");
-  const bmp0 = await createImageBitmap(sel[0]);
-  const W = Math.max(8, Math.round(bmp0.width * opts.inputScale)), H = Math.max(8, Math.round(bmp0.height * opts.inputScale));
-  log(`[load] ${sel.length} images ${bmp0.width}x${bmp0.height} → ${W}x${H}`);
-  bmp0.close();
+  const sizes0 = [];
+  for (const f of sel) sizes0.push(await imageSize(f));
+  const W0 = Math.max(...sizes0.map((s) => s[0])), H0 = Math.max(...sizes0.map((s) => s[1]));
+  const sc = opts.inputScale;
+  const W = Math.max(8, Math.round(W0 * sc)), H = Math.max(8, Math.round(H0 * sc));
+  const sizes = sizes0.map(([w, h]) => [Math.min(W, Math.max(8, Math.round(w * sc))), Math.min(H, Math.max(8, Math.round(h * sc)))]);
+  const differ = sizes0.some((s) => s[0] !== W0 || s[1] !== H0);
+  log(`[load] ${sel.length} images ${W0}x${H0} → ${W}x${H}`);
+  if (differ) {
+    const uniq = [...new Set(sizes0.map((s) => `${s[0]}x${s[1]}`))];
+    log(`[load] サイズの異なる画像を ${W0}x${H0} に揃えました（右・下を端の画素で埋め、合成には使いません）: ${uniq.join(", ")}`);
+  }
   const cv = frameCanvas(W, H);
   const ctx = cv.getContext("2d", { willReadFrequently: true });
   const get = async (k) => {
     const bmp = await createImageBitmap(sel[k]);
-    ctx.drawImage(bmp, 0, 0, W, H);
+    const [w, h] = sizes[k];
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(bmp, 0, 0, w, h);
+    if (w < W || h < H) {
+      ctx.imageSmoothingEnabled = false;
+      if (w < W) ctx.drawImage(bmp, bmp.width - 1, 0, 1, bmp.height, w, 0, W - w, h);            // 右: 最終列を複製
+      if (h < H) ctx.drawImage(bmp, 0, bmp.height - 1, bmp.width, 1, 0, h, w, H - h);            // 下: 最終行を複製
+      if (w < W && h < H) ctx.drawImage(bmp, bmp.width - 1, bmp.height - 1, 1, 1, w, h, W - w, H - h);   // 角
+    }
     bmp.close();
     return ctx.getImageData(0, 0, W, H).data;
   };
-  return { n: sel.length, W, H, get, close: () => {}, kind: "images" };
+  return { n: sel.length, W, H, sizes, get, close: () => {}, kind: "images" };
 }

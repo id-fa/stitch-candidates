@@ -63,6 +63,7 @@
     <button id="cancel" disabled>中断</button>
     <button id="dlPositions" disabled>positions.csv</button>
     <button id="dlPairs" disabled>pairs.csv</button>
+    <button id="dlExposure" disabled>exposure.csv</button>
     <label style="margin-left:12px">memory limit (GB)</label><input type="number" id="memLimit" value="8" step="0.5" min="0" style="width:60px">
     <button id="probe" title="動画を読み込まずに、この値まで 512MB ずつ実際に GPU バッファを確保して確認します。確保できなかった場合は上限を安全な値に下げます">上限を確認</button>
     <span class="hint">GPU バッファ確保量の上限。超える場合は開始前に中止（0 = 無制限）。目安: ディスクリート GPU はメインメモリの 1/2 以下、オンボード GPU は 4〜6 GB から。「上限を確認」で実測できます</span>
@@ -102,6 +103,7 @@
     <div class="row"><label>canvas scale</label><input type="text" id="canvasScale" value="auto"><label><input type="checkbox" id="noRender"> 位置推定のみ</label></div>
     <div class="row"><label>inlier tol</label><input type="number" id="inlierTol" value="0.06" step="0.01"><label>sharp top</label><input type="number" id="sharpTop" value="0.3" step="0.05"><label>res tol</label><input type="number" id="resTol" value="1.25" step="0.05"><span class="hint">最も細部を持つ標本の拡大率 × この値以内の標本だけで合成（ズーム動画の細線保護。0 で無効）</span></div>
     <div class="row"><label>anchor frame</label><input type="number" id="anchorFrame" value="" step="1" placeholder="off"><label>± window</label><input type="number" id="anchorWindow" value="2" step="1" style="width:60px"><span class="hint">抽出後のフレーム番号。そのフレーム±window が覆う範囲はそれらだけで合成（動くキャラクターをその姿で確定）</span></div>
+    <div class="row"><label>exposure</label><select id="exposure"><option value="auto" selected>auto</option><option value="on">on</option><option value="off">off</option></select><label style="min-width:auto"><input type="checkbox" id="exposureProfile" checked> profile</label><label>min score</label><input type="number" id="exposureMinScore" value="0.2" step="0.05" style="width:60px"><span class="hint">フレーム間の明るさの違い（露出・フェード・プレイヤーの周辺グラデーション）を重なりから推定して補正。auto = 画像列では on、動画では off。profile = 全フレーム共通の周辺減光（端に密な折れ線）も推定</span></div>
     <div class="row"><label>hole fill</label><select id="holeFill"><option value="inpaint" selected>inpaint</option><option value="blur">blur</option><option value="none">none</option></select><label>min clean</label><input type="number" id="minCleanCnt" value="12" step="1" style="width:60px"> 件 / <input type="number" id="minCleanPct" value="25" step="1" style="width:60px"> %<span class="hint">クリーン標本が無い、または「件数未満かつ被覆の%未満」の画素を周囲から埋める</span></div>
     <div class="row"><label>stack budget MB</label><input type="number" id="stackBudget" value="128" step="32"><label>level cache MB</label><input type="number" id="levelCache" value="768" step="128"></div>
   </fieldset>

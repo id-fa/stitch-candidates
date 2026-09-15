@@ -25,16 +25,17 @@ export async function render(rc, al) {
   const K = {};
   for (const [name, def] of Object.entries(RENDER)) K[name] = g.kernel(name, def.code, def.fields, def.bindings, def.wg);
   const S = Float64Array.from(al.S), TH = Float64Array.from(al.TH), T = Float64Array.from(al.T);
+  const sizes = rc.sizes;   // 各フレームの有効サイズ [w, h]（パディングはキャンバスに含めない）
   const gsc = a.canvasScale === "auto" ? 1.0 / Math.min(...S) : Number(a.canvasScale);
   for (let k = 0; k < n; k++) { S[k] *= gsc; T[k * 2] *= gsc; T[k * 2 + 1] *= gsc; }
   let minX = Infinity, minY = Infinity;
-  for (let k = 0; k < n; k++) for (const [x, y] of corners(S, TH, T, k, H, W)) { minX = Math.min(minX, x); minY = Math.min(minY, y); }
+  for (let k = 0; k < n; k++) for (const [x, y] of corners(S, TH, T, k, sizes[k][1], sizes[k][0])) { minX = Math.min(minX, x); minY = Math.min(minY, y); }
   const ox = Math.floor(minX + 0.5), oy = Math.floor(minY + 0.5);
   for (let k = 0; k < n; k++) { T[k * 2] -= ox; T[k * 2 + 1] -= oy; }
   const boxes = [];
   let maxX = -Infinity, maxY = -Infinity;
   for (let k = 0; k < n; k++) {
-    const cs = corners(S, TH, T, k, H, W);
+    const cs = corners(S, TH, T, k, sizes[k][1], sizes[k][0]);
     const b = { x0: Math.min(...cs.map((p) => p[0])), x1: Math.max(...cs.map((p) => p[0])),
                 y0: Math.min(...cs.map((p) => p[1])), y1: Math.max(...cs.map((p) => p[1])) };
     boxes.push(b); maxX = Math.max(maxX, b.x1); maxY = Math.max(maxY, b.y1);
@@ -113,6 +114,18 @@ export async function render(rc, al) {
   const stack = g.buf(Kmax * bw * L * 8, "stack");
   const outMed = g.buf(outBytes, "out_med"), outMean = g.buf(outBytes, "out_mean"), outSharp = g.buf(outBytes, "out_sharp"), outCov = g.buf(outBytes, "out_cov");
   const tmp1 = g.buf(W * H * 16, "blur_tmp1"), tmp2 = g.buf(W * H * 16, "blur_tmp2");
+  // 露出補正: プロファイル（節点 + f(y) + g(x)、0..255 単位）を小さなバッファで渡し、フレームごとのゲイン / オフセットは uniform
+  const ex = rc.exposure;
+  let expoBuf = g.zero, nk = 0;
+  if (ex && ex.profile) {
+    nk = ex.knots.length;
+    const arr = new Float32Array(nk + 2 * nk * 3);
+    for (let q = 0; q < nk; q++) arr[q] = ex.knots[q];
+    for (let q = 0; q < nk * 3; q++) { arr[nk + q] = ex.profile.fy[q] * 255; arr[nk + nk * 3 + q] = ex.profile.gx[q] * 255; }
+    expoBuf = g.buf(arr.byteLength, "expo");
+    g.upload(expoBuf, arr);
+  }
+  if (ex) rc.log(`[render] 露出補正を適用${ex.profile ? "（ゲイン / オフセット + 周辺プロファイル）" : "（ゲイン / オフセット）"}`);
   let nb = 0;
   for (const tile of tiles) {
     const x0 = horiz ? tile.t0 : 0, y0 = horiz ? 0 : tile.t0;
@@ -142,8 +155,11 @@ export async function render(rc, al) {
             useBlur = 1;
           }
         }
-        K.warp.run2d({ x0, y0, tw, th, W, H, Wq: rc.Wq, Hq: rc.Hq, slot, sharp_off: k * rc.Hq * rc.Wq, use_blur: useBlur, s, c, sn, Tx, Ty, mag_lv: magLevel(s) },
-          [fr, tmp2, rc.sharpq, stack], tw, th);
+        const gain = ex ? [ex.gain[k * 3], ex.gain[k * 3 + 1], ex.gain[k * 3 + 2], 1] : [1, 1, 1, 1];
+        const off = ex ? [ex.offset[k * 3] * 255, ex.offset[k * 3 + 1] * 255, ex.offset[k * 3 + 2] * 255, 0] : [0, 0, 0, 0];
+        K.warp.run2d({ x0, y0, tw, th, W, H, Wq: rc.Wq, Hq: rc.Hq, slot, sharp_off: k * rc.Hq * rc.Wq, use_blur: useBlur, s, c, sn, Tx, Ty, mag_lv: magLevel(s),
+                       vw: sizes[k][0], vh: sizes[k][1], use_expo: ex ? 1 : 0, nk, gain, off },
+          [fr, tmp2, rc.sharpq, stack, expoBuf], tw, th);
       }
       // アンカーフレームのスロット範囲（ks は昇順なので連続）。無ければ lo > hi
       let ancLo = 1, ancHi = 0;
@@ -168,6 +184,7 @@ export async function render(rc, al) {
     if (covG[i] === 0) holes++; else if (cov[i] === 0) fallback++;
   }
   for (const b of [stack, outMed, outMean, outSharp, outCov, tmp1, tmp2]) g.free(b);
+  if (expoBuf !== g.zero) g.free(expoBuf);
   rc.log(`[render] done ${(now() - t0).toFixed(1)}s, uncovered px=${holes}, fallback (no clean sample) px=${fallback}` +
          (st.allResident ? "" : ` (streaming, ${st.stats()})`));
   rc.progress("render", 1);

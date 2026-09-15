@@ -130,6 +130,7 @@ function readArgs() {
     canvasScale: cs, inlierTol: num("inlierTol", 0.06), sharpTop: num("sharpTop", 0.3), resTol: num("resTol", 1.25),
     anchorFrame: $("anchorFrame").value.trim() === "" ? -1 : int("anchorFrame", -1), anchorWindow: int("anchorWindow", 2),
     stackBudgetMB: int("stackBudget", 128), levelCacheMB: int("levelCache", 768),
+    exposure: $("exposure").value, exposureProfile: $("exposureProfile").checked, exposureMinScore: num("exposureMinScore", 0.2),
   };
 }
 
@@ -228,6 +229,12 @@ async function run() {
     });
     csvButton("dlPairs", `${outPrefix}pairs.csv`, prs);
     window.__last = { positions: pos, pairs: prs };  // デバッグ/検証用
+    // 露出補正: auto は画像列では on、動画では off（Python 版 --exposure auto と同じ）
+    const exposureOn = args.exposure === "on" || (args.exposure === "auto" && !isVideo);
+    if (exposureOn) {
+      await rc.estimateExposure(al);
+      if (rc.exposure) { const ecsv = rc.exposureCsv(); csvButton("dlExposure", `${outPrefix}exposure.csv`, ecsv); window.__last.exposure = ecsv; }
+    }
     if (!$("noRender").checked) {
       const res = await render(rc, al);
       if (args.holeFill !== "none") {

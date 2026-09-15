@@ -1145,6 +1145,20 @@ class PanoramaTab(ttk.Frame):
         self.min_clean_entry.pack(side=tk.LEFT, padx=(12, 0))
         self.min_clean_pct_entry = LabeledEntry(hf, "Min clean %:", "25", width=5)
         self.min_clean_pct_entry.pack(side=tk.LEFT, padx=(12, 0))
+        xf = ttk.Frame(f)
+        xf.pack(fill=tk.X, padx=4)
+        ttk.Label(xf, text="Exposure:").pack(side=tk.LEFT)
+        self.exposure_var = tk.StringVar(value="auto")
+        ttk.Combobox(xf, textvariable=self.exposure_var, values=["auto", "on", "off"],
+                     state="readonly", width=6).pack(side=tk.LEFT, padx=(4, 0))
+        self.exposure_profile_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(xf, text="Profile (vignette)", variable=self.exposure_profile_var).pack(side=tk.LEFT, padx=(12, 0))
+        self.exposure_min_score_entry = LabeledEntry(xf, "Min score:", "0.2", width=5,
+                                                     tooltip="Minimum pair match score used for exposure estimation")
+        self.exposure_min_score_entry.pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(xf, text="Brightness differences between frames (exposure, fades, player gradients) are estimated "
+                           "from the overlaps. auto = on for image sequences, off for video",
+                  foreground="gray").pack(side=tk.LEFT, padx=(12, 0))
 
     def _open_trim_dialog(self):
         """Trim / Crop ダイアログ（trim_dialog.py）。結果を Start/End frame, Crop, Ignore/Text rects に反映。"""
@@ -1323,6 +1337,10 @@ class PanoramaTab(ttk.Frame):
             argv += ["--min-clean", self.min_clean_entry.get()]
         if self.min_clean_pct_entry.get():
             argv += ["--min-clean-pct", self.min_clean_pct_entry.get()]
+        argv += ["--exposure", self.exposure_var.get()]
+        argv += ["--exposure-profile", "on" if self.exposure_profile_var.get() else "off"]
+        if self.exposure_min_score_entry.get():
+            argv += ["--exposure-min-score", self.exposure_min_score_entry.get()]
         return argv
 
     def _run(self):

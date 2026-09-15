@@ -118,11 +118,13 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 //   注意: 候補を k±2span まで増やして「いずれか一致」にすると背景の偶然一致が急増する（実測でマスク 14% → 41%）
 // テキスト矩形 trects の内側は静止条件を外し、勾配 > grad だけで文字画素とみなす（動くティッカー用）
 // 第 2 出力 flat: 静止（勾配条件なし）= 1、テキスト矩形内 = 2（ハロー膨張と組み合わせて使う）
+// vk: フレーム k の有効サイズ (w, h)、vc: 候補 1..4 の有効サイズ (w1,h1,w2,h2),(w3,h3,w4,h4)。有効領域外（パディング）では静止判定しない
 IMG.static_detect = {
-  fields: [["W", "u32"], ["H", "u32"], ["diff", "f32"], ["grad", "f32"], ["ncand", "u32"], ["ntext", "u32"], ["trects", "vec4i", 8]],
+  fields: [["W", "u32"], ["H", "u32"], ["diff", "f32"], ["grad", "f32"], ["ncand", "u32"], ["ntext", "u32"], ["trects", "vec4i", 8],
+           ["vk", "vec4i"], ["vc", "vec4i", 2]],
   bindings: ["r", "r", "r", "r", "r", "rw", "rw"], wg: [16, 16, 1],
   code: COMMON + /* wgsl */ `
-struct P { W: u32, H: u32, diff: f32, grad: f32, ncand: u32, ntext: u32, trects: array<vec4<i32>, 8> }
+struct P { W: u32, H: u32, diff: f32, grad: f32, ncand: u32, ntext: u32, trects: array<vec4<i32>, 8>, vk: vec4<i32>, vc: array<vec4<i32>, 2> }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> fk: array<u32>;
 @group(0) @binding(2) var<storage, read> f1: array<u32>;
@@ -138,10 +140,11 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   if (x >= W || y >= H) { return; }
   let i = y * W + x;
   let gk = luma_u32(fk[i]);
-  var d = abs(gk - luma_u32(f1[i]));
-  if (p.ncand >= 2u) { d = min(d, abs(gk - luma_u32(f2[i]))); }
-  if (p.ncand >= 3u) { d = min(d, abs(gk - luma_u32(f3[i]))); }
-  if (p.ncand >= 4u) { d = min(d, abs(gk - luma_u32(f4[i]))); }
+  let ink = x < p.vk.x && y < p.vk.y;
+  var d = select(1.0, abs(gk - luma_u32(f1[i])), ink && x < p.vc[0].x && y < p.vc[0].y);
+  if (p.ncand >= 2u) { d = min(d, select(1.0, abs(gk - luma_u32(f2[i])), ink && x < p.vc[0].z && y < p.vc[0].w)); }
+  if (p.ncand >= 3u) { d = min(d, select(1.0, abs(gk - luma_u32(f3[i])), ink && x < p.vc[1].x && y < p.vc[1].y)); }
+  if (p.ncand >= 4u) { d = min(d, select(1.0, abs(gk - luma_u32(f4[i])), ink && x < p.vc[1].z && y < p.vc[1].w)); }
   let gx = 0.5 * (luma_u32(fk[y * W + clampi(x + 1, 0, W - 1)]) - luma_u32(fk[y * W + clampi(x - 1, 0, W - 1)]));
   let gy = 0.5 * (luma_u32(fk[clampi(y + 1, 0, H - 1) * W + x]) - luma_u32(fk[clampi(y - 1, 0, H - 1) * W + x]));
   let gm = max(abs(gx), abs(gy));
@@ -205,11 +208,12 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 //   near_r  : 静止エッジ密度マスクを r で膨張したもの（> 0 なら範囲内）
 //   near_rh : 同じくハロー半径 rh で膨張したもの。flat（静止 or テキスト矩形内）と AND してグロー等を含める
 //   rects   : 常に除外する矩形
+//   vw, vh  : フレームの有効サイズ。外側（パディング）は常に除外
 IMG.finalize_mask = {
-  fields: [["W", "u32"], ["H", "u32"], ["use_dens", "u32"], ["nrect", "u32"], ["rects", "vec4i", 8]],
+  fields: [["W", "u32"], ["H", "u32"], ["use_dens", "u32"], ["nrect", "u32"], ["vw", "u32"], ["vh", "u32"], ["rects", "vec4i", 8]],
   bindings: ["r", "r", "r", "r", "rw"], wg: [16, 16, 1],
   code: COMMON + /* wgsl */ `
-struct P { W: u32, H: u32, use_dens: u32, nrect: u32, rects: array<vec4<i32>, 8> }
+struct P { W: u32, H: u32, use_dens: u32, nrect: u32, vw: u32, vh: u32, rects: array<vec4<i32>, 8> }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> near_r: array<f32>;    // 静止エッジ密度を r で膨張
 @group(0) @binding(2) var<storage, read> near_rh: array<f32>;   // 同 halo 半径で膨張（静止画素と AND）
@@ -231,8 +235,37 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
     let rc = p.rects[k];
     if (x >= rc.x && x < rc.x + rc.z && y >= rc.y && y < rc.y + rc.w) { st = true; }
   }
+  if (x >= i32(p.vw) || y >= i32(p.vh)) { st = true; }
   let a = select(255u, 0u, st);
   frame[i] = (frame[i] & 0x00ffffffu) | (a << 24u);
+}`,
+};
+
+// 露出補正用のセル統計: 各セル（cell x cell px）のクリーン画素の RGB 平均（0..1）とクリーン率 → vec4<f32>
+IMG.cell_rgba = {
+  fields: [["W", "u32"], ["H", "u32"], ["w", "u32"], ["h", "u32"], ["cell", "u32"]],
+  bindings: ["r", "rw"], wg: [16, 16, 1],
+  code: /* wgsl */ `
+struct P { W: u32, H: u32, w: u32, h: u32, cell: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> src: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<vec4<f32>>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let x = g.x; let y = g.y;
+  if (x >= p.w || y >= p.h) { return; }
+  let x0 = x * p.cell; let y0 = y * p.cell;
+  var s = vec3<f32>(0.0); var n = 0.0;
+  for (var yy = y0; yy < y0 + p.cell; yy++) {
+    for (var xx = x0; xx < x0 + p.cell; xx++) {
+      let c = src[yy * p.W + xx];
+      if ((c >> 24u) > 127u) {
+        s += vec3<f32>(f32(c & 255u), f32((c >> 8u) & 255u), f32((c >> 16u) & 255u)) / 255.0; n += 1.0;
+      }
+    }
+  }
+  let m = select(vec3<f32>(0.0), s / max(n, 1.0), n > 0.0);
+  dst[y * p.w + x] = vec4<f32>(m, n / f32(p.cell * p.cell));
 }`,
 };
 

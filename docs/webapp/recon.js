@@ -3,14 +3,18 @@
 
 import { IMG } from "./shaders_img.js";
 import { ALIGN } from "./shaders_align.js";
-import { solveGlobal, rot2, mulRot, subpix, median, mean } from "./solve.js";
+import { solveGlobal, solveDense, rot2, mulRot, subpix, median, mean } from "./solve.js";
 
 export const DEFAULTS = {
   model: "scale", pairs: [1, 2, 4], coarseScale: 0.25, coarseTol: 2.0, minOverlap: 0.15,
   scaleMax: 0.06, scaleStep: 0.004, fineScale: 1.0, gnIters: 15, ignoreRects: [], textRects: [],
   staticMask: true, staticSpan: 6, staticDiff: 0.03, staticGrad: 0.08, staticDilate: 7, staticHalo: 12, staticClose: 3, textHalo: 4,
   canvasScale: "auto", band: 64, inlierTol: 0.06, sharpTop: 0.3, resTol: 1.25, anchorFrame: -1, anchorWindow: 2, stackBudgetMB: 128, levelCacheMB: 768,
+  exposureProfile: true, exposureMinScore: 0.2,
 };
+
+// 露出補正プロファイルの節点（正規化座標 0..1）。プレイヤーのグラデーション等は端で急に変わるので端に密に置く
+export const EXPO_KNOTS = [0.0, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 0.95, 0.98, 1.0];
 
 const odd = (n) => { n = Math.round(n); return n % 2 === 1 ? n : n + 1; };
 const now = () => performance.now() / 1000;
@@ -24,6 +28,9 @@ export class Reconstructor {
     this.a = { ...DEFAULTS, ...args };
     this.log = log; this.progress = progress || (() => {});
     this.store = store;
+    this.sizes = store.sizes;                    // 各フレームの有効サイズ [w, h]（パディング領域は除外）
+    this.padded = this.sizes.some(([w, h]) => w !== W || h !== H);
+    this.exposure = null;                        // 露出補正 {gain, offset, profile}（estimateExposure で設定）
     this.abort = false;
     this._dbgFail = 0;
     const cs = this.a.coarseScale;
@@ -95,7 +102,8 @@ export class Reconstructor {
         const cf = [], newly = [];   // 新たに pin したものだけ後で外す（段階 3 待ちで pin 中のフレームと重なることがある）
         for (const j of cands) { cf.push(await st.get(j)); if (!st.pinned.has(j)) { st.pin(j); newly.push(j); } }
         const cf4 = [0, 1, 2, 3].map((q) => cf[Math.min(q, cf.length - 1)]);
-        K.static_detect.run2d({ W, H, diff, grad: a.staticGrad, ncand: cands.length, ntext, trects },
+        const vc = [0, 1, 2, 3].flatMap((q) => this.sizes[cands[Math.min(q, cands.length - 1)]]);
+        K.static_detect.run2d({ W, H, diff, grad: a.staticGrad, ncand: cands.length, ntext, trects, vk: [...this.sizes[k], 0, 0], vc },
           [fr, cf4[0], cf4[1], cf4[2], cf4[3], fA, fD], W, H);
         for (const j of newly) st.unpin(j);
         K.box_blur.run2d({ W, H, r: 2, axis: 0, sub: 0 }, [fA, fA, fB], W, H);
@@ -111,7 +119,7 @@ export class Reconstructor {
         K.box_blur.run2d({ W, H, r: rt, axis: 1, sub: 0 }, [fB, fA, fF], W, H);
         useDens = 1;
       }
-      K.finalize_mask.run2d({ W, H, use_dens: useDens, nrect, rects }, [fC, fE, fF, fD, fr], W, H);
+      K.finalize_mask.run2d({ W, H, use_dens: useDens, nrect, vw: this.sizes[k][0], vh: this.sizes[k][1], rects }, [fC, fE, fF, fD, fr], W, H);
     };
     // 段階 2: マスクの時間方向クロージング（j=1..nclose の前後両方でマスクされていれば埋める）。
     //   k-j は確定済み（読み直しても pack 済みマスクが復元される）、k+j は段階 1 済みで pin 中
@@ -168,9 +176,12 @@ export class Reconstructor {
       if (k % 8 === 7 || k === n + lag - 1) { await g.done(); this.progress("preprocess", (k + 1) / (n + lag)); this._check(); }
     }
     const rat = new Float32Array(await g.read(this.ratioBuf, n * 4));
-    for (let k = 0; k < n; k++) this.overlayRatio[k] = 1.0 - rat[k] / (this.wc * this.hc);
+    for (let k = 0; k < n; k++) {
+      const vf = (this.sizes[k][0] * this.sizes[k][1]) / (W * H);   // 比率は有効領域内で
+      this.overlayRatio[k] = Math.max(0, 1.0 - rat[k] / (this.wc * this.hc * vf));
+    }
     const mr = mean(this.overlayRatio);
-    this.log(`[preprocess] ${n} frames ${W}x${H}, coarse ${this.wc}x${this.hc} / ${this.w16}x${this.h16}, ` +
+    this.log(`[preprocess] ${n} frames ${W}x${H}${this.padded ? " (padded, sizes differ)" : ""}, coarse ${this.wc}x${this.hc} / ${this.w16}x${this.h16}, ` +
              `overlay mask mean ratio=${mr.toFixed(3)}, ${(now() - t0).toFixed(1)}s` + (st.allResident ? "" : ` (streaming, ${st.stats()})`));
     if (mr > 0.5) this.log("  警告: オーバーレイマスクが 50% を超えています。static-span を大きくするか static-diff を小さくしてください");
     this.progress("preprocess", 1);
@@ -274,6 +285,55 @@ export class Reconstructor {
     }));
   }
 
+  /**
+   * 1/16 レベルの全シフト探索で、スケールごとのサーフェスを読み戻して局所ピーク上位 M 個を返す。
+   * jobs: [{i, j, scales: [s,...], nmin}] → [[{s_eff, dx, dy, score}, ...] (score 降順、最大 M 個)]
+   * 1/16 では自己相似な内容（ジーンズ、平坦な壁）で最大値が誤ることがあり、±12 px の 1/4 窓では回復できないため、
+   * 複数の候補を 1/4 で評価して選ぶ（Python 版の 1/4 FFT 全探索に相当する頑健性を得る）
+   */
+  async _search16Peaks(jobs, M) {
+    const K = this.k, g = this.gpu;
+    const h = this.h16, w = this.w16;
+    let slot = 0;
+    const meta = [];
+    for (const jb of jobs) {
+      const A = this.C16[jb.i], B = this.C16[jb.j];
+      const ms = [];
+      for (const s of jb.scales) {
+        const hs = Math.max(8, Math.round(h * s)), ws = Math.max(8, Math.round(w * s));
+        const nx = w + ws - 1, ny = h + hs - 1;
+        if (nx * ny > 4 * 1024 * 1024) throw new Error("NCC surface too large");
+        K.resample2.run2d({ W: w, H: h, w: ws, h: hs }, [B, this.Bs], ws, hs);
+        K.ncc_search.run({ hA: h, wA: w, hB: hs, wB: ws, dx0: -(ws - 1), dy0: -(hs - 1), nx, ny, nmin: jb.nmin, out_off: 0 }, [A, this.Bs, this.surf], nx, ny);
+        // GPU 上で argmax → その周囲 ±3 を潰す → argmax … を M 回（読み戻しはピークごとに 8 floats）
+        for (let t = 0; t < M; t++) {
+          K.argmax.run({ in_off: 0, n: nx * ny, nx, out_off: slot * 8 }, [this.surf, this.resBuf], 1);
+          if (t + 1 < M) K.suppress.run({ in_off: 0, nx, ny, res_off: slot * 8, r: 3 }, [this.resBuf, this.surf], 1);
+          ms.push({ slot, s_eff: hs / h, dx0: -(ws - 1), dy0: -(hs - 1) });
+          slot++;
+          if (slot >= 4096) throw new Error("too many search slots in a batch");
+        }
+      }
+      meta.push(ms);
+    }
+    const res = new Float32Array(await g.read(this.resBuf, slot * 8 * 4));
+    // スコア降順に並べ、近い位置（3 px 以内、スケール違いも含む）は 1 つにまとめて上位 M 個
+    return meta.map((ms) => {
+      const peaks = ms.map((m) => {
+        const o = m.slot * 8;
+        return { s_eff: m.s_eff, score: res[o], dx: m.dx0 + res[o + 6], dy: m.dy0 + res[o + 7] };
+      }).filter((p) => p.score > -1.5);
+      peaks.sort((a, b) => b.score - a.score);
+      const sel = [];
+      for (const p of peaks) {
+        if (sel.length >= M) break;
+        if (sel.some((s) => Math.abs(s.dx - p.dx) <= 3 && Math.abs(s.dy - p.dy) <= 3)) continue;
+        sel.push(p);
+      }
+      return sel;
+    });
+  }
+
   /** 粗推定: 戻り値 pc (m×4: s, th, tx, ty フル解像度単位), sc (m) */
   async coarse(pairs) {
     const a = this.a, n = this.n, m = pairs.length;
@@ -283,6 +343,7 @@ export class Reconstructor {
     const K16 = Math.round(a.scaleMax / step16);
     const nref = Math.ceil(step16 / a.scaleStep / 2) + 1;
     const r4 = 12;
+    const NPEAK = 4;   // 1/16 レベルで 1/4 に持ち上げる候補ピーク数
     const nmin16 = a.minOverlap * this.h16 * this.w16, nmin4 = a.minOverlap * this.hc * this.wc;
     const chain = new Float64Array(n);
     const minOff = Math.min(...a.pairs);
@@ -293,7 +354,7 @@ export class Reconstructor {
     for (const grp of groups) {
       for (let b0 = 0; b0 < grp.length; b0 += BATCH) {
         const rs = grp.slice(b0, b0 + BATCH);
-        // レベル 1/16
+        // レベル 1/16: 全シフト探索の局所ピーク上位 M 個（自己相似な内容での誤ピーク対策）
         const jobs16 = rs.map((r) => {
           const [i, j] = pairs[r];
           let scales = [1.0];
@@ -303,30 +364,40 @@ export class Reconstructor {
             const ks = full ? [...Array(2 * K16 + 1).keys()].map((q) => q - K16) : [-1, 0, 1];
             scales = ks.map((q) => Math.exp(c0 + q * step16));
           }
-          return { i, j, level: 16, scales, win: null, nmin: nmin16 };
+          return { i, j, scales, nmin: nmin16 };
         });
-        const out16 = await this._searchBatch(jobs16);
-        // レベル 1/4
-        const jobs4 = rs.map((r, q) => {
+        const peaks16 = await this._search16Peaks(jobs16, NPEAK);
+        // レベル 1/4: 各候補の周辺（±r4 px、スケールは候補値の近傍）を再探索し、最良の候補を採る
+        const jobs4 = [], owner = [];
+        rs.forEach((r, q) => {
           const [i, j] = pairs[r];
-          const cand = out16[q].scales;
-          let best = 0;
-          for (let t = 1; t < cand.length; t++) if (cand[t].score > cand[best].score) best = t;
-          let ls = Math.log(cand[best].s_eff);
-          if (best > 0 && best < cand.length - 1) {
-            const st = Math.log(cand[best + 1].s_eff) - Math.log(cand[best].s_eff);
-            ls += subpix(cand[best - 1].score, cand[best].score, cand[best + 1].score) * st;
+          const cands = peaks16[q].length ? peaks16[q] : [{ s_eff: 1.0, dx: 0, dy: 0, score: -2 }];
+          for (const c of cands) {
+            let ls = Math.log(c.s_eff);
+            const f = this.wc / this.w16;
+            const scales = scaleModel ? [...Array(2 * nref + 1).keys()].map((q2) => Math.exp(ls + (q2 - nref) * a.scaleStep)) : [1.0];
+            jobs4.push({ i, j, level: 4, scales, win: { dx: Math.round(c.dx * f), dy: Math.round(c.dy * f), r: r4 }, nmin: nmin4 });
+            owner.push(q);
           }
-          const f = this.wc / this.w16;
-          const scales = scaleModel ? [...Array(2 * nref + 1).keys()].map((q2) => Math.exp(ls + (q2 - nref) * a.scaleStep)) : [1.0];
-          return { i, j, level: 4, scales, win: { dx: Math.round(cand[best].dx * f), dy: Math.round(cand[best].dy * f), r: r4 }, nmin: nmin4 };
         });
-        const out4 = await this._searchBatch(jobs4);
+        const out4all = await this._searchBatch(jobs4);
+        const out4 = rs.map(() => null);
+        const dbg = typeof window !== "undefined" && window.__dbgCoarse;
+        out4all.forEach((o, t) => {
+          const q = owner[t];
+          let best = 0;
+          for (let u = 1; u < o.scales.length; u++) if (o.scales[u].score > o.scales[best].score) best = u;
+          if (dbg) {
+            const c16 = peaks16[q][jobs4.slice(0, t).filter((jb) => jb.i === jobs4[t].i && jb.j === jobs4[t].j).length] || {};
+            this.log(`  [coarse dbg] (${jobs4[t].i},${jobs4[t].j}) 1/16 peak s=${(c16.s_eff || 1).toFixed(3)} d=(${c16.dx},${c16.dy}) score=${(c16.score ?? -2).toFixed(3)}` +
+                     ` → 1/4 s=${o.scales[best].s_eff.toFixed(3)} d=(${o.scales[best].dx},${o.scales[best].dy}) score=${o.scales[best].score.toFixed(3)}`);
+          }
+          if (!out4[q] || o.scales[best].score > out4[q].scales[out4[q].best].score) out4[q] = { scales: o.scales, best };
+        });
         rs.forEach((r, q) => {
           const [i, j] = pairs[r];
           const cand = out4[q].scales;
-          let best = 0;
-          for (let t = 1; t < cand.length; t++) if (cand[t].score > cand[best].score) best = t;
+          const best = out4[q].best;
           const c = cand[best];
           let ls = Math.log(c.s_eff);
           if (best > 0 && best < cand.length - 1) {
@@ -469,12 +540,33 @@ export class Reconstructor {
     const { pc, sc } = await this.coarse(pairs);
     const wc = new Float64Array(m);
     for (let r = 0; r < m; r++) wc[r] = Math.min(1, Math.max(0.05, sc[r])) ** 2;
+    // 離れたペア（k > 最小間隔）の粗推定が隣接ペアの連鎖と矛盾していれば重みを落とす（Python 版と同じ）。
+    // 重なりの無いペアでも滑らかな輪郭が偶然合って高い NCC が出ることがあり（静止画列で顕著）、そのままグローバル解に
+    // 入れると正しい隣接ペアまで「不整合」扱いになって精密化の初期値が壊れる
+    const kMin = Math.min(...a.pairs);
+    const chain = [];
+    for (let r = 0; r < m; r++) if (pairs[r][1] - pairs[r][0] === kMin) chain.push(r);
+    let nFarBad = 0;
+    if (chain.length < m && chain.length >= n - 1) {
+      const pcC = new Float64Array(chain.length * 4), wcC = new Float64Array(chain.length);
+      chain.forEach((r, q) => { pcC.set(pc.subarray(r * 4, r * 4 + 4), q * 4); wcC[q] = wc[r]; });
+      const gh = solveGlobal(n, chain.map((r) => pairs[r]), pcC, wcC, model);
+      for (let r = 0; r < m; r++) {
+        if (pairs[r][1] - pairs[r][0] === kMin) continue;
+        const [i, j] = pairs[r];
+        const dp = mulRot(rot2(gh.TH[i]), [pc[r * 4 + 2], pc[r * 4 + 3]]).map((v) => gh.S[i] * v);
+        const err = Math.hypot(dp[0] - (gh.T[j * 2] - gh.T[i * 2]), dp[1] - (gh.T[j * 2 + 1] - gh.T[i * 2 + 1]));
+        const tolFar = Math.max(32, 8 * (j - i) / this.sx);
+        if (err > tolFar) { wc[r] *= 1e-3; nFarBad++; }
+      }
+    }
     const gc = solveGlobal(n, pairs, pc, wc, model);
     const tol = a.coarseTol / this.sx;
     let nBad = 0;
     for (let r = 0; r < m; r++) if (gc.rn[r] > tol) nBad++;
     this.log(`[coarse] ${m} pairs, model=${model}, score mean=${mean(sc).toFixed(3)}, ` +
-             `residual median=${(median(gc.rn) * this.sx).toFixed(2)}px (coarse), inconsistent pairs=${nBad}, ${(now() - t0).toFixed(1)}s`);
+             `residual median=${(median(gc.rn) * this.sx).toFixed(2)}px (coarse), inconsistent pairs=${nBad}` +
+             (nFarBad ? `, far pairs inconsistent with chain=${nFarBad}` : "") + `, ${(now() - t0).toFixed(1)}s`);
 
     t0 = now();
     const pf = new Float64Array(m * 4), sf = new Float64Array(m);
@@ -567,6 +659,200 @@ export class Reconstructor {
     this.freeCoarse();
     if (!this.store.allResident) this.log(`  streaming: ${this.store.stats()}`);
     return { S: sol.S, TH: sol.TH, T: sol.T, pairs: pairsOk, pp: PF, sc: SF, rn };
+  }
+
+  // ------------------------------------------------------------ 露出補正（Python 版 estimate_exposure と同じモデル）
+  /**
+   * フレーム間の明るさの違い（露出・フェード・プレイヤーの周辺グラデーション等）を重なりから推定する。
+   * モデル: I_k(x, y) = g_k L(X) + a_k + f(y/h_k) + g(x/w_k)
+   *   g_k, a_k: フレームごとのゲインとオフセット（チャンネル別）、f, g: 全フレーム共通の加算プロファイル（折れ線、節点は端に密）
+   * ペア (i, j) の重なりを 32 px ブロックに分け、クリーン画素のブロック平均の差 I_i - I_j を観測として全パラメータを
+   * 最小二乗（IRLS, Cauchy）で解く。Σ a_k = 0, Σ (g_k - 1) = 0 で全体の明るさを保つ。合成時に (I - a_k - f - g) / g_k。
+   * 結果は this.exposure = {gain: Float64Array(n*3), offset: Float64Array(n*3) (0..1 単位), profile: null | {fy, gx: Float64Array(NK*3)}}
+   */
+  async estimateExposure(al) {
+    const a = this.a, g = this.gpu, K = this.k, W = this.W, H = this.H, n = this.n, st = this.store;
+    const t0 = now();
+    const cell = 8, blk = 4;
+    const h8 = Math.max(2, Math.floor(H / cell)), w8 = Math.max(2, Math.floor(W / cell));
+    const knots = a.exposureProfile ? EXPO_KNOTS : [];
+    const NK = knots.length;
+    // セル統計（クリーン画素の RGB 平均とクリーン率）を GPU で計算して読み戻す
+    const cb = g.buf(h8 * w8 * 16, "cells");
+    const M = new Array(n);
+    for (let k = 0; k < n; k++) {
+      const fr = await st.get(k);
+      K.cell_rgba.run2d({ W, H, w: w8, h: h8, cell }, [fr, cb], w8, h8);
+      M[k] = new Float32Array(await g.read(cb, h8 * w8 * 16));
+      if (k % 16 === 15) { this.progress("exposure", 0.5 * k / n); this._check(); }
+    }
+    g.free(cb);
+    // セル画像の双一次サンプル（align_corners=True: セル座標 0..w8-1）
+    const smp = new Float64Array(4);
+    const sample = (Mk, u, v) => {
+      const x0 = Math.min(w8 - 2, Math.max(0, Math.floor(u))), y0 = Math.min(h8 - 2, Math.max(0, Math.floor(v)));
+      const fx = Math.min(1, Math.max(0, u - x0)), fy = Math.min(1, Math.max(0, v - y0));
+      const o00 = (y0 * w8 + x0) * 4, o10 = o00 + 4, o01 = o00 + w8 * 4, o11 = o01 + 4;
+      for (let c = 0; c < 4; c++) {
+        smp[c] = Mk[o00 + c] * (1 - fx) * (1 - fy) + Mk[o10 + c] * fx * (1 - fy) + Mk[o01 + c] * (1 - fx) * fy + Mk[o11 + c] * fx * fy;
+      }
+      return smp;
+    };
+    const hb = Math.floor(h8 / blk), wb = Math.floor(w8 / blk);
+    const obs = { i: [], j: [], mi: [], mj: [], xi: [], yi: [], xj: [], yj: [], w: [] };
+    let nPairs = 0;
+    const acc = new Float64Array(hb * wb * 12);
+    for (let r = 0; r < al.pairs.length; r++) {
+      if (al.sc[r] < a.exposureMinScore) continue;
+      const [i, j] = al.pairs[r];
+      const s = al.pp[r * 4], th = al.pp[r * 4 + 1], tx = al.pp[r * 4 + 2], ty = al.pp[r * 4 + 3];
+      const c = Math.cos(th), sn = Math.sin(th);
+      const Mi = M[i], Mj = M[j];
+      const [wi, hi] = this.sizes[i], [wj, hj] = this.sizes[j];
+      acc.fill(0);
+      for (let cy = 0; cy < hb * blk; cy++) {
+        for (let cx = 0; cx < wb * blk; cx++) {
+          const oi = (cy * w8 + cx) * 4;
+          if (Mi[oi + 3] <= 0.5) continue;
+          const Xi = (cx + 0.5) * cell - 0.5, Yi = (cy + 0.5) * cell - 0.5;
+          // x_i = s R x_j + t  →  x_j = R^T (x_i - t) / s
+          const u = (Xi - tx) / s, v = (Yi - ty) / s;
+          const Xj = c * u + sn * v, Yj = -sn * u + c * v;
+          const uj = (Xj + 0.5) / cell - 0.5, vj = (Yj + 0.5) / cell - 0.5;
+          if (uj < 0 || uj > w8 - 1 || vj < 0 || vj > h8 - 1) continue;
+          const sj = sample(Mj, uj, vj);
+          if (sj[3] <= 0.5) continue;
+          const b = (Math.floor(cy / blk) * wb + Math.floor(cx / blk)) * 12;
+          acc[b] += 1;
+          acc[b + 1] += Mi[oi]; acc[b + 2] += Mi[oi + 1]; acc[b + 3] += Mi[oi + 2];
+          acc[b + 4] += sj[0]; acc[b + 5] += sj[1]; acc[b + 6] += sj[2];
+          acc[b + 7] += Xi; acc[b + 8] += Yi; acc[b + 9] += Xj; acc[b + 10] += Yj;
+        }
+      }
+      let used = false;
+      for (let b = 0; b < hb * wb; b++) {
+        const cnt = acc[b * 12], wf = cnt / (blk * blk);
+        if (wf < 0.7) continue;
+        used = true;
+        const o = b * 12;
+        obs.i.push(i); obs.j.push(j); obs.w.push(wf);
+        obs.mi.push([acc[o + 1] / cnt, acc[o + 2] / cnt, acc[o + 3] / cnt]);
+        obs.mj.push([acc[o + 4] / cnt, acc[o + 5] / cnt, acc[o + 6] / cnt]);
+        obs.xi.push((acc[o + 7] / cnt + 0.5) / wi); obs.yi.push((acc[o + 8] / cnt + 0.5) / hi);
+        obs.xj.push((acc[o + 9] / cnt + 0.5) / wj); obs.yj.push((acc[o + 10] / cnt + 0.5) / hj);
+      }
+      if (used) nPairs++;
+    }
+    const N = obs.i.length;
+    if (N === 0) { this.log("[exposure] 重なりの観測が得られないため露出補正を行いません"); return; }
+    // 未知数 [δg_0..δg_{n-1}, a_0..a_{n-1}, f_0..f_{NK-1}, g_0..g_{NK-1}]。観測ごとの疎な行（最大 12 要素）
+    const P = 2 * n + 2 * NK, Q = 4 + 4 * NK * 0 + (NK ? 8 : 0);
+    const cols = new Int32Array(N * Q), vals = new Float64Array(N * Q);
+    const hat = (t) => {
+      t = Math.min(1, Math.max(0, t));
+      let q = 0;
+      for (let i = 1; i + 1 < NK; i++) if (t >= knots[i]) q = i;
+      const f = Math.min(1, Math.max(0, (t - knots[q]) / (knots[q + 1] - knots[q])));
+      return [q, f];
+    };
+    for (let o = 0; o < N; o++) {
+      const b = o * Q, i = obs.i[o], j = obs.j[o];
+      cols[b] = i; cols[b + 1] = j; cols[b + 2] = n + i; cols[b + 3] = n + j;
+      vals[b + 2] = 1; vals[b + 3] = -1;                       // vals[b], vals[b+1] = ±L̄（チャンネル別に設定）
+      if (NK) {
+        const [qi, fi] = hat(obs.yi[o]), [qj, fj] = hat(obs.yj[o]), [pi, gi] = hat(obs.xi[o]), [pj, gj] = hat(obs.xj[o]);
+        cols[b + 4] = 2 * n + qi; vals[b + 4] = 1 - fi; cols[b + 5] = 2 * n + qi + 1; vals[b + 5] = fi;
+        cols[b + 6] = 2 * n + qj; vals[b + 6] = -(1 - fj); cols[b + 7] = 2 * n + qj + 1; vals[b + 7] = -fj;
+        cols[b + 8] = 2 * n + NK + pi; vals[b + 8] = 1 - gi; cols[b + 9] = 2 * n + NK + pi + 1; vals[b + 9] = gi;
+        cols[b + 10] = 2 * n + NK + pj; vals[b + 10] = -(1 - gj); cols[b + 11] = 2 * n + NK + pj + 1; vals[b + 11] = -gj;
+      }
+    }
+    // 正則化: ゲインは 1 へ、プロファイルは 0 と滑らかさへ（弱く）、Σ δg = Σ a = 0（ゲージ）
+    const reg = new Float64Array(P);
+    // オフセットのリッジはプロファイルより強く（フレーム固定の縦ランプはゲージ不定なので共通プロファイル側に寄せる。Python 版と同じ）
+    for (let k = 0; k < n; k++) { reg[k] = 1e-2 * N / n; reg[n + k] = 1e-2 * N / n; }
+    const fixed = new Float64Array(P * P);
+    for (const [lo, hi] of [[0, n], [n, 2 * n]]) for (let p = lo; p < hi; p++) for (let q = lo; q < hi; q++) fixed[p * P + q] += N;
+    if (NK) {
+      for (let q = 2 * n; q < P; q++) reg[q] = 1e-4 * N / NK;
+      for (const base of [2 * n, 2 * n + NK]) {
+        for (let t = 0; t < NK - 2; t++) {
+          const h1 = knots[t + 1] - knots[t], h2 = knots[t + 2] - knots[t + 1], sc = 0.5 * (h1 + h2);
+          const row = [[base + t, sc / h1], [base + t + 1, -sc * (1 / h1 + 1 / h2)], [base + t + 2, sc / h2]];
+          for (const [p, vp] of row) for (const [q, vq] of row) fixed[p * P + q] += vp * vq * 1e-2 * N / NK;
+        }
+      }
+    }
+    for (let p = 0; p < P; p++) fixed[p * P + p] += reg[p];
+    const cthr = 0.03;                                            // Cauchy スケール（0..1 単位 ≈ 8 階調）
+    const theta = new Float64Array(P * 3);
+    const res = new Float64Array(N * 3), d = new Float64Array(N * 3);
+    for (let ch = 0; ch < 3; ch++) {
+      const wt = Float64Array.from(obs.w);
+      for (let o = 0; o < N; o++) {
+        const lb = 0.5 * (obs.mi[o][ch] + obs.mj[o][ch]);
+        vals[o * Q] = lb; vals[o * Q + 1] = -lb;
+        d[o * 3 + ch] = obs.mi[o][ch] - obs.mj[o][ch];
+      }
+      let th = null;
+      for (let it = 0; it < 5; it++) {
+        const AtA = Float64Array.from(fixed), Atb = new Float64Array(P);
+        for (let o = 0; o < N; o++) {
+          const b = o * Q, w = wt[o], dc = d[o * 3 + ch];
+          for (let p = 0; p < Q; p++) {
+            const cp = cols[b + p], vp = vals[b + p] * w;
+            if (vp === 0) continue;
+            Atb[cp] += vp * dc;
+            for (let q = 0; q < Q; q++) AtA[cp * P + cols[b + q]] += vp * vals[b + q];
+          }
+        }
+        th = solveDense(P, AtA, Atb, 1);
+        for (let o = 0; o < N; o++) {
+          const b = o * Q;
+          let r = -d[o * 3 + ch];
+          for (let p = 0; p < Q; p++) r += vals[b + p] * th[cols[b + p]];
+          res[o * 3 + ch] = r;
+          wt[o] = obs.w[o] / (1 + (r / cthr) ** 2);
+        }
+      }
+      for (let p = 0; p < P; p++) theta[p * 3 + ch] = th[p];
+    }
+    const gain = new Float64Array(n * 3), offset = new Float64Array(n * 3);
+    for (let k = 0; k < n; k++) for (let c = 0; c < 3; c++) { gain[k * 3 + c] = 1 + theta[k * 3 + c]; offset[k * 3 + c] = theta[(n + k) * 3 + c]; }
+    let profile = null;
+    if (NK) {
+      profile = { fy: theta.slice(2 * n * 3, (2 * n + NK) * 3), gx: theta.slice((2 * n + NK) * 3, P * 3) };
+    }
+    this.exposure = { gain, offset, profile, knots };
+    const absmean = (arr) => { const out = new Float64Array(N); for (let o = 0; o < N; o++) out[o] = (Math.abs(arr[o * 3]) + Math.abs(arr[o * 3 + 1]) + Math.abs(arr[o * 3 + 2])) / 3; return out; };
+    const mad0 = median(absmean(d)) * 255, mad1 = median(absmean(res)) * 255;
+    let msg = `[exposure] ${nPairs} pairs, ${N} blocks, 重なりの差（中央値）${mad0.toFixed(2)} → ${mad1.toFixed(2)} 階調, ` +
+              `gain ${Math.min(...gain).toFixed(3)}-${Math.max(...gain).toFixed(3)}, offset ${(Math.min(...offset) * 255).toFixed(1)}..${(Math.max(...offset) * 255).toFixed(1)} 階調`;
+    if (profile) {
+      const lum = (arr) => Array.from({ length: NK }, (_, q) => (arr[q * 3] + arr[q * 3 + 1] + arr[q * 3 + 2]) / 3 * 255);
+      const py = lum(profile.fy), px = lum(profile.gx);
+      msg += `, profile y ${Math.min(...py).toFixed(1)}..${Math.max(...py).toFixed(1)} / x ${Math.min(...px).toFixed(1)}..${Math.max(...px).toFixed(1)} 階調`;
+    }
+    this.log(`${msg}, ${(now() - t0).toFixed(1)}s`);
+    this.progress("exposure", 1);
+  }
+
+  /** 露出補正の CSV（exposure.csv と同じ形式） */
+  exposureCsv() {
+    const e = this.exposure;
+    if (!e) return "";
+    let s = "frame,gain_r,gain_g,gain_b,offset_r,offset_g,offset_b\n";
+    for (let k = 0; k < this.n; k++) {
+      s += `${k},${[0, 1, 2].map((c) => e.gain[k * 3 + c].toFixed(4)).join(",")},${[0, 1, 2].map((c) => (e.offset[k * 3 + c] * 255).toFixed(2)).join(",")}\n`;
+    }
+    if (e.profile) {
+      s += "\nknot,fy_r,fy_g,fy_b,gx_r,gx_g,gx_b\n";
+      for (let q = 0; q < e.knots.length; q++) {
+        s += `${e.knots[q].toFixed(2)},${[0, 1, 2].map((c) => (e.profile.fy[q * 3 + c] * 255).toFixed(2)).join(",")},` +
+             `${[0, 1, 2].map((c) => (e.profile.gx[q * 3 + c] * 255).toFixed(2)).join(",")}\n`;
+      }
+    }
+    return s;
   }
 
   /** フレーム k の RGBA（alpha = クリーンフラグ）を読み戻す */

@@ -34,12 +34,13 @@ import argparse
 import csv
 import glob
 import math
+import os
 import re
 import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -100,6 +101,22 @@ def load_frames_from_paths(paths: List[Path], every: int, max_frames: int,
         if max_frames and len(frames) >= max_frames:
             break
     return frames
+
+
+def pad_to_common_size(frames: List[np.ndarray]) -> Tuple[List[np.ndarray], Optional[List[Tuple[int, int]]]]:
+    """
+    サイズの異なるフレーム（スクリーンショット等）を最大サイズに揃える。右・下を端の画素の複製で埋め（ハイパス等の
+    境界応答を抑えるため黒ではなく複製）、元のサイズを返す。全て同じサイズなら sizes は None。
+    """
+    sizes = [(f.shape[0], f.shape[1]) for f in frames]
+    H = max(h for h, _ in sizes)
+    W = max(w for _, w in sizes)
+    if all(s == (H, W) for s in sizes):
+        return frames, None
+    out = []
+    for f, (h, w) in zip(frames, sizes):
+        out.append(np.pad(f, ((0, H - h), (0, W - w), (0, 0)), mode="edge") if (h, w) != (H, W) else f)
+    return out, sizes
 
 
 def load_frames_from_video(path: Path, every: int, fps: Optional[float],
@@ -375,7 +392,8 @@ class Alignment:
 # -------------------------
 
 class Reconstructor:
-    def __init__(self, frames: List[np.ndarray], device: torch.device, args) -> None:
+    def __init__(self, frames: List[np.ndarray], device: torch.device, args,
+                 sizes: Optional[List[Tuple[int, int]]] = None) -> None:
         self.frames = frames
         self.n = len(frames)
         self.H, self.W = frames[0].shape[:2]
@@ -383,7 +401,12 @@ class Reconstructor:
         self.args = args
         for k, f in enumerate(frames):
             if f.shape[:2] != (self.H, self.W):
-                sys.exit(f"フレーム {k} のサイズが異なります: {f.shape[:2]} != {(self.H, self.W)}")
+                sys.exit(f"フレーム {k} のサイズが異なります: {f.shape[:2]} != {(self.H, self.W)}"
+                         "（pad_to_common_size で揃えてください）")
+        # 各フレームの有効サイズ (h, w)。パディングされたフレームは右・下の複製領域を無効として扱う
+        self.sizes: List[Tuple[int, int]] = list(sizes) if sizes is not None else [(self.H, self.W)] * self.n
+        self.padded = any(s != (self.H, self.W) for s in self.sizes)
+        self.exposure: Optional[Dict[str, Any]] = None   # 露出補正 {gain (n,3), offset (n,3), profile ((K,3),(K,3)) | None}
         # キャッシュ
         self.gray_u8: List[np.ndarray] = []          # フル解像度グレー (uint8)
         self.overlay: List[np.ndarray] = []          # 静止オーバーレイ + 無視領域 (bool, H×W)
@@ -417,6 +440,16 @@ class Reconstructor:
         span = a.static_span
         ratios = []
         use_static = a.static_mask and self.n > 1
+        # 有効領域（パディングされたフレームのみ）: 右・下の複製領域は位置合わせ・合成の両方から除外する
+        self.valid_t: List[Optional[torch.Tensor]] = []
+        for k in range(self.n):
+            hk, wk = self.sizes[k]
+            if (hk, wk) == (H, W):
+                self.valid_t.append(None)
+            else:
+                v = torch.zeros((H, W), dtype=torch.bool, device=self.dev)
+                v[:hk, :wk] = True
+                self.valid_t.append(v)
         for k in range(self.n):
             g = self._gray_tensor(k)
             if use_static or has_text:
@@ -428,6 +461,10 @@ class Reconstructor:
                     diff = None
                     for j in cands:
                         dj = (g - self._gray_tensor(j)).abs()
+                        # どちらかの無効領域（パディング）では静止判定しない
+                        for v in (self.valid_t[k], self.valid_t[j]):
+                            if v is not None:
+                                dj = torch.where(v, dj, torch.ones_like(dj))
                         diff = dj if diff is None else torch.minimum(diff, dj)
                     flat = diff < a.static_diff          # 静止（勾配条件なし）
                     edge = flat & (gm > a.static_grad)   # 静止エッジ
@@ -447,6 +484,9 @@ class Reconstructor:
             else:
                 static = torch.zeros_like(g, dtype=torch.bool)
             ov = static | ignore
+            vk = self.valid_t[k]
+            if vk is not None:
+                ov = ov | ~vk
             self.overlay.append(ov.cpu().numpy())
         # 時間方向クロージング: 前後 j フレーム（両側）でマスクされている画素はこのフレームでもマスク（光沢アニメ等の抜け対策）
         nclose = max(0, min(3, int(a.static_close)))
@@ -458,7 +498,8 @@ class Reconstructor:
                         m = m | (self.overlay[k - j] & self.overlay[k + j])
                 self.overlay[k] = m
         for k in range(self.n):
-            ratios.append(float(self.overlay[k].mean()))
+            hk, wk = self.sizes[k]
+            ratios.append(float(self.overlay[k][:hk, :wk].mean()))   # 比率は有効領域内で
             g = self._gray_tensor(k)
             ov = torch.from_numpy(self.overlay[k]).to(self.dev)
             # 鮮明度（ラプラシアン絶対値のボックス平均）を 1/4 で保持
@@ -474,8 +515,8 @@ class Reconstructor:
         self.hc, self.wc = self.coarse_hp[0].shape
         self.sx, self.sy = self.wc / W, self.hc / H
         mean_ratio = float(np.mean(ratios))
-        log(f"[preprocess] {self.n} frames {W}x{H}, coarse {self.wc}x{self.hc}, "
-            f"overlay mask mean ratio={mean_ratio:.3f}, {time.time() - t0:.1f}s")
+        log(f"[preprocess] {self.n} frames {W}x{H}" + (" (padded, sizes differ)" if self.padded else "") +
+            f", coarse {self.wc}x{self.hc}, overlay mask mean ratio={mean_ratio:.3f}, {time.time() - t0:.1f}s")
         if mean_ratio > 0.5:
             log("  警告: オーバーレイマスクが 50% を超えています。--static-span を大きくするか "
                 "--static-diff を小さくしてください（スクロールが遅い可能性）")
@@ -707,12 +748,31 @@ class Reconstructor:
                 if j - i == min(a.pair_offsets):
                     chain_ls[j] = chain_ls[i] + math.log(s_)
         wc = np.clip(sc, 0.05, 1.0) ** 2
+        # 離れたペア（k > 最小間隔）の粗推定が隣接ペアの連鎖と矛盾していれば重みを落とす。
+        # 重なりの無いペアでも滑らかな輪郭が偶然合って高い NCC が出ることがあり（静止画列で顕著）、
+        # そのままグローバル解に入れると正しい隣接ペアまで「不整合」扱いになって精密化の初期値が壊れる
+        k_min = min(a.pair_offsets)
+        chain = [r_ for r_ in range(m) if pairs[r_][1] - pairs[r_][0] == k_min]
+        n_far_bad = 0
+        if len(chain) < m and len(chain) >= n - 1:
+            S_h, TH_h, T_h, _ = self._solve_global(n, [pairs[r_] for r_ in chain], pc[chain], wc[chain], model)
+            for r_ in range(m):
+                if r_ in chain:
+                    continue
+                i, j = pairs[r_]
+                d_pair = S_h[i] * (rot2(TH_h[i]) @ pc[r_, 2:4])
+                err = float(np.linalg.norm(d_pair - (T_h[j] - T_h[i])))
+                tol_far = max(32.0, 8.0 * (j - i) / self.sx)
+                if err > tol_far:
+                    wc[r_] *= 1e-3
+                    n_far_bad += 1
         # 粗解の整合性チェック（平行移動成分のみ、フル解像度 px）
         S_c, TH_c, T_c, rn_c = self._solve_global(n, pairs, pc, wc, model)
         n_bad = int((rn_c > a.coarse_tol / self.sx).sum())
         log(f"[coarse] {m} pairs, model={model}, score mean={sc.mean():.3f}, "
-            f"residual median={np.median(rn_c) * self.sx:.2f}px (coarse), inconsistent pairs={n_bad}, "
-            f"{time.time() - t0:.1f}s")
+            f"residual median={np.median(rn_c) * self.sx:.2f}px (coarse), inconsistent pairs={n_bad}"
+            + (f", far pairs inconsistent with chain={n_far_bad}" if n_far_bad else "") +
+            f", {time.time() - t0:.1f}s")
 
         # 精密推定
         t0 = time.time()
@@ -819,6 +879,231 @@ class Reconstructor:
         T, rn, _ = solve_positions(n, pairs, d, w, c=2.0)
         return S, TH, T, rn
 
+    # ---- 露出補正 ----
+    # 節点位置（正規化座標 0..1）: プレイヤーのグラデーション等は端で急に変わるので端に密に置く
+    EXPO_KNOTS = [0.0, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9, 0.95, 0.98, 1.0]
+
+    @staticmethod
+    def _hat(t: torch.Tensor, knots: torch.Tensor) -> torch.Tensor:
+        """折れ線補間の基底（ハット関数）。t (...) → (..., K)"""
+        K = knots.shape[0]
+        t = t.clamp(0.0, 1.0)
+        q0 = (torch.searchsorted(knots, t.reshape(-1).contiguous(), right=True) - 1).clamp(0, K - 2).reshape(t.shape)
+        k0, k1 = knots[q0], knots[q0 + 1]
+        f = ((t - k0) / (k1 - k0)).clamp(0.0, 1.0)
+        out = torch.zeros(t.shape + (K,), dtype=t.dtype, device=t.device)
+        out.scatter_(-1, q0[..., None], (1.0 - f)[..., None])
+        out.scatter_(-1, (q0 + 1)[..., None], f[..., None])
+        return out
+
+    def _exposure_at(self, k: int, fx: torch.Tensor, fy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        フレーム k の画素座標 (fx, fy) における (オフセット (3, ...), 1/ゲイン (3, 1, 1))。
+        補正後 = (I - オフセット) / ゲイン。値は 0..1 スケール。
+        """
+        e = self.exposure
+        assert e is not None
+        hk, wk = self.sizes[k]
+        off = torch.from_numpy(e["offset"][k]).to(fx.device, torch.float32)         # (3,)
+        out = off[:, None, None].expand(3, *fx.shape).clone()
+        if e["profile"] is not None:
+            knots = torch.tensor(self.EXPO_KNOTS, device=fx.device, dtype=torch.float32)
+            fy_ = torch.from_numpy(e["profile"][0]).to(fx.device, torch.float32)   # (K, 3)
+            fx_ = torch.from_numpy(e["profile"][1]).to(fx.device, torch.float32)
+            By = self._hat((fy + 0.5) / hk, knots)                                  # (..., K)
+            Bx = self._hat((fx + 0.5) / wk, knots)
+            out = out + (By @ fy_ + Bx @ fx_).movedim(-1, 0)
+        invg = torch.from_numpy(1.0 / e["gain"][k]).to(fx.device, torch.float32)
+        return out, invg[:, None, None]
+
+    def estimate_exposure(self, pairs: List[Tuple[int, int]], pp: np.ndarray, sc: np.ndarray,
+                          out_dir: Optional[Path] = None) -> None:
+        """
+        フレーム間の明るさの違い（露出・フェード・プレイヤーの周辺グラデーションなど）を重なりから推定する。
+        モデル: I_k(x, y) = g_k L(X) + a_k + f(y/h_k) + g(x/w_k)
+          g_k, a_k: フレームごとのゲインとオフセット（チャンネル別）、f, g: 全フレーム共通の加算プロファイル
+          （有効サイズで正規化した座標の折れ線。節点は端に密）。
+        ペア (i, j) の重なりを 32 px ブロックに分け、クリーン画素のブロック平均の差 I_i - I_j を観測として
+        全パラメータを最小二乗（IRLS, Cauchy）で解く。L は (I_i + I_j)/2 で近似。Σ a_k = 0, Σ (g_k - 1) = 0 で
+        全体の明るさを保ち、g_k は 1 へ、プロファイルは 0 と滑らかさへ弱く正則化する。合成時に (I - a_k - f - g) / g_k。
+        """
+        a = self.args
+        n, H, W, dev = self.n, self.H, self.W, self.dev
+        cell, blk = 8, 4                                  # 8 px セル平均 → 4x4 セル = 32 px ブロック
+        h8, w8 = max(2, H // cell), max(2, W // cell)
+        use_profile = a.exposure_profile != "off"
+        knots = torch.tensor(self.EXPO_KNOTS, device=dev, dtype=torch.float64)
+        K = knots.shape[0] if use_profile else 0
+        t0 = time.time()
+        M: List[torch.Tensor] = []
+        V: List[torch.Tensor] = []
+        for k in range(n):
+            img = torch.from_numpy(self.frames[k]).to(dev).permute(2, 0, 1).float() / 255.0
+            clean = torch.from_numpy(~self.overlay[k]).to(dev).float()
+            vk = downsample_area(clean, (h8, w8))
+            mk = torch.stack([downsample_area(img[c] * clean, (h8, w8)) for c in range(3)]) / vk.clamp(min=1e-6)[None]
+            M.append(mk)
+            V.append(vk)
+        ys, xs = torch.meshgrid(torch.arange(h8, device=dev, dtype=torch.float32),
+                                torch.arange(w8, device=dev, dtype=torch.float32), indexing="ij")
+        Xi = (xs + 0.5) * cell - 0.5      # セル中心のフル解像度画素座標
+        Yi = (ys + 0.5) * cell - 0.5
+
+        def pool(t: torch.Tensor) -> torch.Tensor:
+            t4 = t[None, None] if t.dim() == 2 else t[None]
+            return F.avg_pool2d(t4, blk)[0]
+
+        obs = []   # (fi, fj, mi (m,3), mj (m,3), xni, yni, xnj, ynj, w)
+        n_pairs_used = 0
+        for r_, (i, j) in enumerate(pairs):
+            if sc[r_] < a.exposure_min_score:
+                continue
+            s, th, tx, ty = (float(v) for v in pp[r_])
+            c, sn = math.cos(th), math.sin(th)
+            # x_i = s R x_j + t  →  x_j = R^T (x_i - t) / s
+            u = (Xi - tx) / s
+            v = (Yi - ty) / s
+            Xj = c * u + sn * v
+            Yj = -sn * u + c * v
+            uj = (Xj + 0.5) / cell - 0.5
+            vj = (Yj + 0.5) / cell - 0.5
+            grid = torch.stack([2.0 * uj / (w8 - 1) - 1.0, 2.0 * vj / (h8 - 1) - 1.0], dim=-1)[None]
+            src = torch.cat([M[j], V[j][None]])[None]
+            smp = F.grid_sample(src, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0]
+            Mj, Vj = smp[:3], smp[3]
+            inside = (uj >= 0) & (uj <= w8 - 1) & (vj >= 0) & (vj <= h8 - 1)
+            w = ((V[i] > 0.5) & (Vj > 0.5) & inside).float()
+            wb = pool(w)[0]
+            if float(wb.max()) < 0.7:
+                continue
+            inv = 1.0 / wb.clamp(min=1e-6)
+            Mi_b = pool(M[i] * w[None]) * inv[None]
+            Mj_b = pool(Mj * w[None]) * inv[None]
+            Xi_b, Yi_b = pool(Xi * w)[0] * inv, pool(Yi * w)[0] * inv
+            Xj_b, Yj_b = pool(Xj * w)[0] * inv, pool(Yj * w)[0] * inv
+            keep = wb >= 0.7
+            if int(keep.sum()) == 0:
+                continue
+            n_pairs_used += 1
+            hi, wi = self.sizes[i]
+            hj, wj = self.sizes[j]
+            obs.append((i, j, Mi_b.permute(1, 2, 0)[keep].double(), Mj_b.permute(1, 2, 0)[keep].double(),
+                        ((Xi_b + 0.5) / wi)[keep].double(), ((Yi_b + 0.5) / hi)[keep].double(),
+                        ((Xj_b + 0.5) / wj)[keep].double(), ((Yj_b + 0.5) / hj)[keep].double(), wb[keep].double()))
+        if not obs:
+            log("[exposure] 重なりの観測が得られないため露出補正を行いません")
+            return
+        fi = torch.cat([torch.full((o[2].shape[0],), o[0], device=dev, dtype=torch.long) for o in obs])
+        fj = torch.cat([torch.full((o[2].shape[0],), o[1], device=dev, dtype=torch.long) for o in obs])
+        Mi = torch.cat([o[2] for o in obs])          # (N, 3)
+        Mj = torch.cat([o[3] for o in obs])
+        xni, yni = torch.cat([o[4] for o in obs]), torch.cat([o[5] for o in obs])
+        xnj, ynj = torch.cat([o[6] for o in obs]), torch.cat([o[7] for o in obs])
+        w0 = torch.cat([o[8] for o in obs])
+        N = Mi.shape[0]
+        # 未知数: [δg_0..δg_{n-1}, a_0..a_{n-1}, f_0..f_{K-1}, g_0..g_{K-1}]（チャンネル別に解く）
+        P = 2 * n + 2 * K
+        d = Mi - Mj                                   # (N, 3)
+        Lbar = 0.5 * (Mi + Mj)                        # (N, 3)
+        # 位置に依らない部分の疎な行: 列と値（チャンネル共通）
+        cols_c = [fi + n, fj + n]
+        vals_c = [torch.ones(N, device=dev, dtype=torch.float64), -torch.ones(N, device=dev, dtype=torch.float64)]
+        if use_profile:
+            # 折れ線基底は隣り合う 2 節点だけが非零（疎な行にしないと N × Q² が爆発する）
+            def hat2(t: torch.Tensor, base: int, sign: float) -> None:
+                t = t.clamp(0.0, 1.0)
+                q0 = (torch.searchsorted(knots, t.contiguous(), right=True) - 1).clamp(0, K - 2)
+                f = ((t - knots[q0]) / (knots[q0 + 1] - knots[q0])).clamp(0.0, 1.0)
+                cols_c.extend([base + q0, base + q0 + 1])
+                vals_c.extend([sign * (1.0 - f), sign * f])
+            hat2(yni, 2 * n, 1.0)
+            hat2(ynj, 2 * n, -1.0)
+            hat2(xni, 2 * n + K, 1.0)
+            hat2(xnj, 2 * n + K, -1.0)
+        cols_common = torch.stack(cols_c, 1)          # (N, Q)
+        vals_common = torch.stack(vals_c, 1)
+        # 正則化
+        reg = torch.zeros(P, dtype=torch.float64, device=dev)
+        # ゲインは 1 へ、オフセットは 0 へ（弱く）。フレーム固定の縦ランプは「等間隔に並ぶフレームごとの定数」でも
+        # 「共通プロファイルの直線」でも同じ観測になる（ゲージ不定）ので、オフセットのリッジをプロファイルより強くして
+        # 共通プロファイル側に寄せる（スクリーンショットのプレイヤーグラデーションはこちら。定数だけの場合はそのまま残る）
+        reg[:n] = 1e-2 * N / n
+        reg[n:2 * n] = 1e-2 * N / n
+        gauge = torch.zeros((P, P), dtype=torch.float64, device=dev)
+        for lo, hi in ((0, n), (n, 2 * n)):
+            ind = torch.zeros(P, dtype=torch.float64, device=dev)
+            ind[lo:hi] = 1.0
+            gauge += ind[:, None] * ind[None, :] * float(N)      # Σ δg_k = 0, Σ a_k = 0
+        smooth = torch.zeros((P, P), dtype=torch.float64, device=dev)
+        if use_profile:
+            reg[2 * n:] = 1e-4 * N / K
+            kn = knots
+            for base in (2 * n, 2 * n + K):
+                for t in range(K - 2):
+                    h1, h2 = float(kn[t + 1] - kn[t]), float(kn[t + 2] - kn[t + 1])
+                    row = torch.zeros(P, dtype=torch.float64, device=dev)
+                    row[base + t], row[base + t + 1], row[base + t + 2] = 1.0 / h1, -(1.0 / h1 + 1.0 / h2), 1.0 / h2
+                    row *= 0.5 * (h1 + h2)
+                    smooth += row[:, None] * row[None, :]
+            smooth *= 1e-2 * N / K
+        cthr = 0.03                                   # Cauchy スケール（0..1 単位 ≈ 8 階調）
+        theta = torch.zeros((P, 3), dtype=torch.float64, device=dev)
+        res = d.clone()
+        for ch in range(3):
+            cols = torch.cat([fi[:, None], fj[:, None], cols_common], 1)            # (N, Q+2)
+            vals = torch.cat([Lbar[:, ch:ch + 1], -Lbar[:, ch:ch + 1], vals_common], 1)
+            outer = cols[:, :, None].expand(-1, -1, cols.shape[1])
+            inner = cols[:, None, :].expand(-1, cols.shape[1], -1)
+            wt = w0.clone()
+            dc = d[:, ch]
+            th_c = torch.zeros(P, dtype=torch.float64, device=dev)
+            r = dc.clone()
+            for _ in range(5):
+                AtA = torch.zeros((P, P), dtype=torch.float64, device=dev)
+                prod = (vals[:, :, None] * vals[:, None, :]) * wt[:, None, None]
+                AtA.index_put_((outer.reshape(-1), inner.reshape(-1)), prod.reshape(-1), accumulate=True)
+                Atb = torch.zeros(P, dtype=torch.float64, device=dev)
+                Atb.index_put_((cols.reshape(-1),), (vals * (wt * dc)[:, None]).reshape(-1), accumulate=True)
+                AtA = AtA + torch.diag(reg) + gauge + smooth
+                th_c = torch.linalg.solve(AtA, Atb)
+                r = (vals * th_c[cols]).sum(1) - dc
+                wt = w0 / (1.0 + (r / cthr) ** 2)
+            theta[:, ch] = th_c
+            res[:, ch] = r
+        gain = (1.0 + theta[:n]).cpu().numpy()                        # (n, 3)
+        offset = theta[n:2 * n].cpu().numpy()                          # (n, 3) 0..1 単位
+        profile = (theta[2 * n:2 * n + K].cpu().numpy(), theta[2 * n + K:].cpu().numpy()) if use_profile else None
+        self.exposure = {"gain": gain, "offset": offset, "profile": profile}
+        mad0 = float(d.abs().mean(1).median()) * 255.0
+        mad1 = float(res.abs().mean(1).median()) * 255.0
+        msg = (f"[exposure] {n_pairs_used} pairs, {N} blocks, 重なりの差（中央値）{mad0:.2f} → {mad1:.2f} 階調, "
+               f"gain {gain.min():.3f}-{gain.max():.3f}, offset {offset.min() * 255:+.1f}..{offset.max() * 255:+.1f} 階調")
+        if profile is not None:
+            py, px = profile[0].mean(1) * 255.0, profile[1].mean(1) * 255.0
+            msg += f", profile y {py.min():+.1f}..{py.max():+.1f} / x {px.min():+.1f}..{px.max():+.1f} 階調"
+        log(msg + f", {time.time() - t0:.1f}s")
+        if out_dir is not None:
+            with open(out_dir / "exposure.csv", "w", newline="", encoding="utf-8") as f:
+                wr = csv.writer(f)
+                wr.writerow(["frame", "gain_r", "gain_g", "gain_b", "offset_r", "offset_g", "offset_b"])
+                for k in range(n):
+                    wr.writerow([k] + [f"{v:.4f}" for v in gain[k]] + [f"{v * 255:.2f}" for v in offset[k]])
+                if profile is not None:
+                    wr.writerow([])
+                    wr.writerow(["knot", "fy_r", "fy_g", "fy_b", "gx_r", "gx_g", "gx_b"])
+                    for q in range(K):
+                        wr.writerow([f"{self.EXPO_KNOTS[q]:.2f}"] + [f"{v * 255:.2f}" for v in profile[0][q]] +
+                                    [f"{v * 255:.2f}" for v in profile[1][q]])
+            if os.environ.get("PANORAMA_EXPOSURE_DEBUG"):
+                with open(out_dir / "exposure_obs.csv", "w", newline="", encoding="utf-8") as f:
+                    wr = csv.writer(f)
+                    wr.writerow(["i", "j", "xi", "yi", "xj", "yj", "d_r", "d_g", "d_b", "res_r", "res_g", "res_b", "w"])
+                    for q in range(N):
+                        wr.writerow([int(fi[q]), int(fj[q]), f"{float(xni[q]):.4f}", f"{float(yni[q]):.4f}",
+                                     f"{float(xnj[q]):.4f}", f"{float(ynj[q]):.4f}"] +
+                                    [f"{float(v) * 255:.2f}" for v in d[q]] + [f"{float(v) * 255:.2f}" for v in res[q]] +
+                                    [f"{float(w0[q]):.3f}"])
+
     # ---- 合成 ----
     def render(self, al: Alignment) -> Dict[str, np.ndarray]:
         a = self.args
@@ -829,11 +1114,11 @@ class Reconstructor:
         S *= g
         T *= g
         al2 = Alignment(S, TH, T)
-        allc = np.concatenate([al2.corners(k, H, W) for k in range(n)])
+        allc = np.concatenate([al2.corners(k, *self.sizes[k]) for k in range(n)])
         origin = np.floor(allc.min(axis=0) + 0.5)
         T -= origin
         al2 = Alignment(S, TH, T)
-        boxes = [al2.corners(k, H, W) for k in range(n)]
+        boxes = [al2.corners(k, *self.sizes[k]) for k in range(n)]   # 有効領域の四隅（パディングは含めない）
         Wc = int(math.ceil(max(b[:, 0].max() for b in boxes) + 0.5))
         Hc = int(math.ceil(max(b[:, 1].max() for b in boxes) + 0.5))
         log(f"[render] canvas {Wc}x{Hc}, canvas scale={g:.4f}, band={a.band}")
@@ -868,8 +1153,15 @@ class Reconstructor:
                 clean = torch.from_numpy(~self.overlay[k]).to(dev).float()
                 sh = torch.from_numpy(self.sharp_q[k].astype(np.float32)).to(dev)
                 sh = F.interpolate(sh[None, None], size=(H, W), mode="bilinear", align_corners=False)[0, 0]
-                ax = torch.stack([torch.ones_like(clean), clean, sh])[None]
-                vals.append(F.grid_sample(img, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0])
+                # 幾何的有効: パディングされたフレームは有効領域の内側だけ（境界は従来のフレーム端と同じ扱い）
+                vk = self.valid_t[k]
+                geom = vk.float() if vk is not None else torch.ones_like(clean)
+                ax = torch.stack([geom, clean, sh])[None]
+                smp = F.grid_sample(img, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0]
+                if self.exposure is not None:
+                    off, invg = self._exposure_at(k, fx, fy)
+                    smp = (smp - off) * invg
+                vals.append(smp)
                 aux.append(F.grid_sample(ax, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0])
             if not ks:
                 holes += bh * Wc
@@ -1036,6 +1328,16 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--static-close", type=int, default=3,
                     help="前後 N フレームの両方でマスクされている画素をマスク（光沢アニメ対策, 0-3, default: 3）")
 
+    ex = ap.add_argument_group("露出補正（フレーム間の明るさの違い）")
+    ex.add_argument("--exposure", type=str, default="auto", choices=["auto", "on", "off"],
+                    help="重なりからフレームごとの明るさ（露出・周辺減光）の違いを推定して補正する。"
+                         "auto: 画像列（--frames）では on、動画では off（default: auto）")
+    ex.add_argument("--exposure-profile", type=str, default="on", choices=["on", "off"],
+                    help="全フレーム共通の周辺減光プロファイル（画像端に密な節点の折れ線, x と y）も推定する（default: on）。"
+                         "off ならフレームごとのゲインとオフセットのみ")
+    ex.add_argument("--exposure-min-score", type=float, default=0.2,
+                    help="露出推定に使うペアの最小マッチスコア（default: 0.2）")
+
     rd = ap.add_argument_group("合成")
     rd.add_argument("--canvas-scale", type=str, default="auto",
                     help="キャンバス倍率: auto（最も寄ったフレームが等倍）または数値（frame0 基準、1=frame0 等倍）")
@@ -1092,14 +1394,22 @@ def main(argv: Optional[List[str]] = None) -> None:
         log(f"[load] {len(frames)} frames from {len(paths)} files")
     if len(frames) < 2:
         sys.exit("フレームが 2 枚未満です")
+    frames, sizes = pad_to_common_size(frames)
+    if sizes is not None:
+        uniq = sorted(set(sizes))
+        log(f"[load] サイズの異なる画像を {frames[0].shape[1]}x{frames[0].shape[0]} に揃えました（右・下を端の画素で埋め、"
+            f"合成には使いません）: " + ", ".join(f"{w}x{h}" for h, w in uniq))
+    exposure_on = a.exposure == "on" or (a.exposure == "auto" and not a.video)
 
     out_dir = Path(a.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rc = Reconstructor(frames, dev, a)
+    rc = Reconstructor(frames, dev, a, sizes)
     rc.preprocess()
     rc.save_debug_overlay(out_dir)
     al, pairs, pp, sc, rn = rc.align()
+    if exposure_on:
+        rc.estimate_exposure(pairs, pp, sc, out_dir)
 
     with open(out_dir / "positions.csv", "w", newline="", encoding="utf-8") as f:
         wr = csv.writer(f)

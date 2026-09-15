@@ -101,6 +101,27 @@ fn main(@builtin(local_invocation_id) l: vec3<u32>) {
 }`,
 };
 
+// argmax の結果 (ix, iy) = res[res_off+6, +7] の周囲 ±r をサーフェス上で -2 にする（次の argmax で別のピークを得るため）
+ALIGN.suppress = {
+  fields: [["in_off", "u32"], ["nx", "u32"], ["ny", "u32"], ["res_off", "u32"], ["r", "i32"]],
+  bindings: ["r", "rw"], wg: [64, 1, 1],
+  code: /* wgsl */ `
+struct P { in_off: u32, nx: u32, ny: u32, res_off: u32, r: i32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> res: array<f32>;
+@group(0) @binding(2) var<storage, read_write> surf: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) l: vec3<u32>) {
+  let ix = i32(res[p.res_off + 6u]); let iy = i32(res[p.res_off + 7u]);
+  let d = 2 * p.r + 1;
+  let n = u32(d * d);
+  for (var t = l.x; t < n; t += 64u) {
+    let x = ix + i32(t % u32(d)) - p.r; let y = iy + i32(t / u32(d)) - p.r;
+    if (x >= 0 && x < i32(p.nx) && y >= 0 && y < i32(p.ny)) { surf[p.in_off + u32(y) * p.nx + u32(x)] = -2.0; }
+  }
+}`,
+};
+
 const GN_COMMON = /* wgsl */ `
 struct P { hs: u32, ws: u32, hb: u32, wb: u32, lv: f32, slot: u32, nbins: u32, rmax: f32, model: u32, nwg: u32, last: u32 }
 @group(0) @binding(0) var<uniform> p: P;

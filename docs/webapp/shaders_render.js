@@ -36,21 +36,36 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 }`,
 };
 
+//   vw, vh: フレームの有効サイズ（パディング領域は幾何的に無効として扱う）
+//   露出補正: use_expo=1 なら col = (col - off - 255 (f(y/vh) + g(x/vw))) / gain。expo バッファ: [knots(nk), fy(nk*3), gx(nk*3)]（0..255 単位）
 RENDER.warp = {
   fields: [["x0", "u32"], ["y0", "u32"], ["tw", "u32"], ["th", "u32"], ["W", "u32"], ["H", "u32"], ["Wq", "u32"], ["Hq", "u32"],
            ["slot", "u32"], ["sharp_off", "u32"], ["use_blur", "u32"],
-           ["s", "f32"], ["c", "f32"], ["sn", "f32"], ["Tx", "f32"], ["Ty", "f32"], ["mag_lv", "u32"]],
-  bindings: ["r", "r", "r", "rw"], wg: [16, 16, 1],
+           ["s", "f32"], ["c", "f32"], ["sn", "f32"], ["Tx", "f32"], ["Ty", "f32"], ["mag_lv", "u32"],
+           ["vw", "u32"], ["vh", "u32"], ["use_expo", "u32"], ["nk", "u32"], ["gain", "vec4f"], ["off", "vec4f"]],
+  bindings: ["r", "r", "r", "rw", "r"], wg: [16, 16, 1],
   code: /* wgsl */ `
 struct P { x0: u32, y0: u32, tw: u32, th: u32, W: u32, H: u32, Wq: u32, Hq: u32, slot: u32, sharp_off: u32, use_blur: u32,
-           s: f32, c: f32, sn: f32, Tx: f32, Ty: f32, mag_lv: u32 }
+           s: f32, c: f32, sn: f32, Tx: f32, Ty: f32, mag_lv: u32, vw: u32, vh: u32, use_expo: u32, nk: u32, gain: vec4<f32>, off: vec4<f32> }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> frame: array<u32>;
 @group(0) @binding(2) var<storage, read> blurred: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> sharpq: array<f32>;
 @group(0) @binding(4) var<storage, read_write> stack: array<u32>;
+@group(0) @binding(5) var<storage, read> expo: array<f32>;
 fn rgba_of(c: u32) -> vec4<f32> {
   return vec4<f32>(f32(c & 255u), f32((c >> 8u) & 255u), f32((c >> 16u) & 255u), f32(c >> 24u));
+}
+// 折れ線プロファイル: 節点 expo[0..nk), 値 expo[base + q*3 + c]
+fn prof(t_in: f32, base: u32) -> vec3<f32> {
+  let t = clamp(t_in, 0.0, 1.0);
+  var q = 0u;
+  for (var i = 1u; i + 1u < p.nk; i++) { if (t >= expo[i]) { q = i; } }
+  let k0 = expo[q]; let k1 = expo[q + 1u];
+  let f = clamp((t - k0) / max(k1 - k0, 1e-6), 0.0, 1.0);
+  let a = vec3<f32>(expo[base + q * 3u], expo[base + q * 3u + 1u], expo[base + q * 3u + 2u]);
+  let b = vec3<f32>(expo[base + (q + 1u) * 3u], expo[base + (q + 1u) * 3u + 1u], expo[base + (q + 1u) * 3u + 2u]);
+  return a * (1.0 - f) + b * f;
 }
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -62,7 +77,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let fx = p.c * u + p.sn * v; let fy = -p.sn * u + p.c * v;
   let W = i32(p.W); let H = i32(p.H);
   let eps = 1e-3;
-  if (fx < -eps || fx > f32(W - 1) + eps || fy < -eps || fy > f32(H - 1) + eps) {
+  if (fx < -eps || fx > f32(i32(p.vw) - 1) + eps || fy < -eps || fy > f32(i32(p.vh) - 1) + eps) {
     stack[o] = 0u; stack[o + 1u] = 0u; return;
   }
   let x0f = floor(fx); let y0f = floor(fy);
@@ -76,6 +91,12 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   if (p.use_blur == 1u) {
     let b = blurred[y0 * W + x0] * w00 + blurred[y0 * W + x1] * w10 + blurred[y1 * W + x0] * w01 + blurred[y1 * W + x1] * w11;
     col = vec4<f32>(b.x, b.y, b.z, col.w);
+  }
+  if (p.use_expo == 1u) {
+    var offs = p.off.xyz;
+    if (p.nk > 0u) { offs += prof((fy + 0.5) / f32(p.vh), p.nk) + prof((fx + 0.5) / f32(p.vw), p.nk + p.nk * 3u); }
+    let cc = (col.xyz - offs) / p.gain.xyz;
+    col = vec4<f32>(cc.x, cc.y, cc.z, col.w);
   }
   let clean = col.w > 127.5;
   // 鮮明度（1/4 マップ、align_corners=False の拡大に相当）
