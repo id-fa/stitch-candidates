@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Panorama Reconstruct (WebGPU) - id-fa/stitch_candidates</title>
+<meta property="og:title" content="アニメキャプつなぎ Panorama Reconstruct (WebGPU版)" />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://id-fa.github.io/stitch-candidates/webapp/" />
+<meta property="og:image" content="https://id-fa.github.io/stitch-candidates/ogimage.png" />
 <style>
   :root { color-scheme: light dark; --bg: #f5f5f7; --fg: #1d1d1f; --panel: #fff; --line: #d0d0d5; --acc: #2d6cdf; }
   @media (prefers-color-scheme: dark) { :root { --bg: #17171a; --fg: #e8e8ec; --panel: #222226; --line: #3a3a40; --acc: #6ea0ff; } }
@@ -33,6 +37,12 @@
   @media (prefers-color-scheme: dark) { .banner.err { background: #3a1c1c; border-color: #8a3a3a; color: #ffb3b3; } }
   .drop { max-width: 900px; border: 2px dashed var(--line); border-radius: 8px; padding: 10px; margin-bottom: 8px; background: var(--panel); }
   .drop.over { border-color: var(--acc); background: color-mix(in srgb, var(--acc) 10%, var(--panel)); }
+  #thumbs { display: flex; gap: 4px; overflow-x: auto; padding: 4px 0 2px; margin: 4px 0; }
+  #thumbs[hidden] { display: none; }
+  .thumb { position: relative; flex: 0 0 auto; line-height: 0; }
+  .thumb canvas { height: 64px; display: block; border: 1px solid var(--line); border-radius: 3px; background: #333; }
+  .thumb span { position: absolute; left: 2px; bottom: 2px; padding: 0 4px; font-size: 10px; line-height: 14px; color: #fff;
+    background: rgba(0,0,0,.6); border-radius: 2px; pointer-events: none; }
   details > summary { cursor: pointer; font-weight: 600; margin: 4px 0 8px; }
   #trim { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-bottom: 8px; }
   .trim-previews { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -57,6 +67,7 @@
 <div id="gpuStatus" class="banner" hidden></div>
   <div id="drop" class="drop">
   <div class="row"><input type="file" id="file" accept="video/*,image/*" multiple> <span id="fileInfo" class="hint"></span></div>
+  <div id="thumbs" hidden></div>
   <div class="hint">動画1ファイル、または重ね合わせ部分のある画像を複数選択。ここに動画ファイルやフレーム画像をドロップしても可</div>
   <div class="row" style="margin-top:6px">
     <button id="run" class="primary">実行</button>

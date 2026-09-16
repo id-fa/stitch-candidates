@@ -204,6 +204,10 @@ export async function openVideoSource(file, opts, log) {
 }
 
 const naturalKey = (s) => s.split(/(\d+)/).map((t) => (/^\d+$/.test(t) ? t.padStart(12, "0") : t.toLowerCase())).join("");
+/** 静止画をフレーム順（ファイル名の自然順）に並べる。openImageSource と UI のサムネイル表示で共通に使う */
+export function sortImageFiles(files) {
+  return [...files].sort((a, b) => (naturalKey(a.name) < naturalKey(b.name) ? -1 : 1));
+}
 
 /** 画像ファイルの (幅, 高さ)。PNG / JPEG はヘッダから読む（デコード不要）。それ以外は createImageBitmap */
 async function imageSize(file) {
@@ -239,7 +243,7 @@ async function imageSize(file) {
  * 複製領域は位置合わせ・合成の両方から除外される（Python 版 pad_to_common_size と同じ）
  */
 export async function openImageSource(files, opts, log) {
-  const list = [...files].sort((a, b) => (naturalKey(a.name) < naturalKey(b.name) ? -1 : 1));
+  const list = sortImageFiles(files);
   const sel = list.filter((_, i) => i % opts.every === 0).slice(0, opts.maxFrames > 0 ? opts.maxFrames : undefined);
   if (!sel.length) throw new Error("画像がありません");
   const sizes0 = [];

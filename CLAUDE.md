@@ -324,6 +324,7 @@ cd web && python -m http.server 8765   # ES モジュールのため file:// で
   テロップ / ロゴを消したいときだけ有効にする
 - 保存形式（2026-09-16 追加）: 「PNG 保存」「WebP 保存」「JPEG 保存」+ 品質欄（既定 92、WebP は 100 で可逆）。`app.js` の `saveImage` が
   `canvas.toBlob` で書き出し、ブラウザが形式に対応しない / WebP の一辺 16383 px 上限を超えるときは返ってきた blob の型に拡張子を合わせる
+- 静止画のサムネイル（2026-09-16 追加）: 画像を選択 / ドロップすると `#thumbs` に高さ 64px のサムネイルをフレーム順（`frames.js` の `sortImageFiles`、`openImageSource` と同じ自然順）で並べ、左下に番号を出す。`app.js` の `showThumbs`（`createImageBitmap` の `resizeHeight` で縮小、世代番号で選び直し時の古いデコードを捨てる）。動画選択時は非表示
 - ファイル: `index.html` (UI), `app.js` (入出力), `frames.js` (フレーム供給 / GPU キャッシュ), `trim.js` (トリム/クロップ), `gpu.js` (基盤),
   `shaders_img.js` / `shaders_align.js` / `shaders_render.js` (WGSL), `recon.js` (位置合わせ), `render.js` (合成), `postfx.js` (穴埋め),
   `solve.js` (CPU 最小二乗)

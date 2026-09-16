@@ -6,7 +6,7 @@ import { render } from "./render.js";
 import { fillHoles } from "./postfx.js";
 import { denoiseRGBA } from "./denoise.js";
 import { TrimPanel } from "./trim.js";
-import { FrameStore, openVideoSource, openImageSource, isVideoFile } from "./frames.js";
+import { FrameStore, openVideoSource, openImageSource, isVideoFile, sortImageFiles } from "./frames.js";
 
 const $ = (id) => document.getElementById(id);
 const logEl = $("log");
@@ -421,16 +421,54 @@ const trim = new TrimPanel($("trim"), {
   },
 });
 window.__trim = trim;   // デバッグ/検証用
+// 静止画のサムネイル（読み込み順 = openImageSource と同じ自然順）。高さ 64px の小さいキャンバスに縮小して並べる
+const THUMB_H = 64;
+let thumbGen = 0;   // 選び直しで古い非同期デコードの結果を捨てるための世代番号
+async function showThumbs(files) {
+  const el = $("thumbs");
+  const gen = ++thumbGen;
+  el.replaceChildren();
+  if (!files.length) { el.hidden = true; return; }
+  el.hidden = false;
+  const items = sortImageFiles(files).map((f, i) => {
+    const d = document.createElement("div");
+    d.className = "thumb";
+    d.title = `${i}: ${f.name}`;
+    const cv = document.createElement("canvas");
+    cv.width = Math.round(THUMB_H * 16 / 9); cv.height = THUMB_H;   // デコード完了までの仮サイズ
+    const lab = document.createElement("span");
+    lab.textContent = String(i);
+    d.append(cv, lab);
+    el.append(d);
+    return { f, cv, d };
+  });
+  for (const { f, cv, d } of items) {
+    if (gen !== thumbGen) return;
+    try {
+      const bmp = await createImageBitmap(f, { resizeHeight: THUMB_H * devicePixelRatio, resizeQuality: "medium" });
+      if (gen !== thumbGen) { bmp.close(); return; }
+      cv.width = bmp.width; cv.height = bmp.height;
+      cv.getContext("2d").drawImage(bmp, 0, 0);
+      bmp.close();
+    } catch (e) {
+      d.title += `
+読み込み失敗: ${e.message || e}`;
+      cv.style.opacity = ".3";
+    }
+  }
+}
 function setFiles(list) {
   selectedFiles = [...list].filter((f) => f.type.startsWith("video/") || f.type.startsWith("image/") || /\.(mp4|webm|mov|m4v|mkv|png|jpe?g|webp|bmp)$/i.test(f.name));
   const n = selectedFiles.length;
   $("fileInfo").textContent = n === 0 ? "" : n === 1 ? selectedFiles[0].name : `${selectedFiles[0].name} 他 ${n} files`;
-  if (n === 1 && isVideoFile(selectedFiles[0])) {
+  const isVideo = n === 1 && isVideoFile(selectedFiles[0]);
+  if (isVideo) {
     $("trimBox").hidden = false;
     trim.load(selectedFiles[0], num("fps", 30)).catch((e) => log(`[trim] ${e.message || e}`));
   } else {
     trim.hide(); $("trimBox").hidden = true;
   }
+  showThumbs(isVideo ? [] : selectedFiles).catch((e) => log(`[thumbs] ${e.message || e}`));
 }
 $("file").onchange = () => setFiles($("file").files);
 // ページ全体でドロップを受け付ける（ドロップ領域はハイライト表示）
