@@ -74,8 +74,8 @@
 <div class="grid">
 <div>
   <div class="row" style="margin:6px 0 8px">
-    <label style="min-width:auto"><input type="checkbox" id="staticMask" checked> 静止オーバーレイ検出</label>
-    <span class="hint">テロップ除去が不要の場合は無効に（ズーム中心付近の動かない細線をテロップと誤判定して消すことがある）。テロップがある場合は有効のまま、細線が消えるなら span を大きく</span>
+    <label style="min-width:auto"><input type="checkbox" id="staticMask"> 静止オーバーレイ検出</label>
+    <span class="hint">既定は無効。テロップ（画面に固定された文字・ロゴ）を消したい場合に有効にする。有効時はズーム中心付近の動かない細線をテロップと誤判定して消すことがあるので、細線が消えるなら span を大きく</span>
   </div>
   <details id="params">
   <summary>パラメータ</summary>
@@ -111,7 +111,7 @@
 </div>
 <div>
   <pre id="log"></pre>
-  <div class="row" style="margin-top:8px"><span id="tabs"></span><button id="dlPng">PNG 保存</button><button id="denoise" title="表示中の画像に à trous ウェーブレットのノイズ除去を掛けて別タブに出します（スティッチとは独立した後処理）。しきい値は最細レベルの階調（目安 6〜12）">ノイズ除去</button><input type="number" id="denoiseThr" value="8" step="1" min="1" style="width:50px" title="しきい値（階調）"><span id="viewInfo" class="hint"></span></div>
+  <div class="row" style="margin-top:8px"><span id="tabs"></span><button id="dlPng" title="可逆圧縮。サイズは大きい">PNG 保存</button><button id="dlWebp" title="WebP で保存。品質 100 は可逆（lossless）、それ未満は非可逆。一辺 16383 px を超える画像は WebP にできない（ブラウザが PNG にフォールバックする）">WebP 保存</button><button id="dlJpeg" title="JPEG で保存（非可逆、透明部分は黒になる）">JPEG 保存</button><input type="number" id="dlQuality" value="92" step="1" min="1" max="100" style="width:50px" title="WebP / JPEG の品質 1〜100（WebP は 100 で可逆）"><button id="denoise" title="表示中の画像に à trous ウェーブレットのノイズ除去を掛けて別タブに出します（スティッチとは独立した後処理）。しきい値は最細レベルの階調（目安 6〜12）">ノイズ除去</button><input type="number" id="denoiseThr" value="8" step="1" min="1" style="width:50px" title="しきい値（階調）"><span id="viewInfo" class="hint"></span></div>
   <div id="view"></div>
 </div>
 </div>

@@ -158,7 +158,9 @@ function selectTab(name) {
   view.appendChild(results[name].canvas);
   for (const b of $("tabs").querySelectorAll(".tab")) b.classList.toggle("active", b.dataset.name === name);
   $("viewInfo").textContent = `${results[name].label}: ${results[name].w} x ${results[name].h}`;
-  $("dlPng").onclick = () => results[name].canvas.toBlob((blob) => download(blob, `${outPrefix}${name}.png`), "image/png");
+  $("dlPng").onclick = () => saveImage(name, "png");
+  $("dlWebp").onclick = () => saveImage(name, "webp");
+  $("dlJpeg").onclick = () => saveImage(name, "jpeg");
   $("denoise").onclick = () => denoiseCurrent(name);
 }
 // 表示中の画像に à trous ウェーブレットのノイズ除去（denoise.js）を掛けて別タブに出す（スティッチとは独立した後処理）
@@ -184,6 +186,23 @@ async function denoiseCurrent(name) {
     running = false;
     $("run").disabled = !!gpuError; $("denoise").disabled = false;
   }
+}
+// 表示中の結果を PNG / WebP / JPEG で保存する。品質欄は WebP / JPEG のみに効く（WebP は 100 で可逆）。
+// ブラウザが形式に対応していない、または WebP の上限 16383 px を超える場合は PNG が返るので、拡張子を実際の形式に合わせる
+function saveImage(name, fmt) {
+  const r = results[name];
+  if (!r) return;
+  const mime = { png: "image/png", webp: "image/webp", jpeg: "image/jpeg" }[fmt];
+  const q = Math.min(100, Math.max(1, int("dlQuality", 92))) / 100;
+  const t0 = performance.now();
+  r.canvas.toBlob((blob) => {
+    if (!blob) { log(`[save] ${fmt} の保存に失敗しました（画像が大きすぎる可能性があります）`); return; }
+    const ext = { "image/png": "png", "image/webp": "webp", "image/jpeg": "jpg" }[blob.type] || fmt;
+    if (blob.type !== mime) log(`[save] このブラウザ / サイズでは ${fmt} にできないため ${ext} で保存します`);
+    download(blob, `${outPrefix}${name}.${ext}`);
+    log(`[save] ${outPrefix}${name}.${ext}: ${(blob.size / 1048576).toFixed(2)} MB` +
+      (ext === "png" ? "" : ` (品質 ${Math.round(q * 100)})`) + `, ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+  }, mime, fmt === "png" ? undefined : q);
 }
 function download(blob, filename) {
   const a = document.createElement("a");

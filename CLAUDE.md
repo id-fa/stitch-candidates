@@ -320,6 +320,10 @@ cd web && python -m http.server 8765   # ES モジュールのため file:// で
   タイル化し、キャッシュが帯の被覆数より少なければ等間隔に間引く（`stride`）。旧版と出力がバイト一致することを確認済み。
   注意: FrameStore の破棄は `gpu.submit()` 後に行う（未送信コマンドの参照を壊さない）。複数フレームを `get()` で集めてから
   カーネルを積む箇所は必ず pin する（集めている間の破棄でバッファが無効になる）
+- 静止オーバーレイ検出は Web 版では既定オフ（2026-09-16 変更。`#staticMask` チェックと `recon.js` の既定値。Python 版の既定は変わらずオン）。
+  テロップ / ロゴを消したいときだけ有効にする
+- 保存形式（2026-09-16 追加）: 「PNG 保存」「WebP 保存」「JPEG 保存」+ 品質欄（既定 92、WebP は 100 で可逆）。`app.js` の `saveImage` が
+  `canvas.toBlob` で書き出し、ブラウザが形式に対応しない / WebP の一辺 16383 px 上限を超えるときは返ってきた blob の型に拡張子を合わせる
 - ファイル: `index.html` (UI), `app.js` (入出力), `frames.js` (フレーム供給 / GPU キャッシュ), `trim.js` (トリム/クロップ), `gpu.js` (基盤),
   `shaders_img.js` / `shaders_align.js` / `shaders_render.js` (WGSL), `recon.js` (位置合わせ), `render.js` (合成), `postfx.js` (穴埋め),
   `solve.js` (CPU 最小二乗)
