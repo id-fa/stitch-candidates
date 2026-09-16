@@ -53,11 +53,11 @@
 </style>
 </head>
 <body>
-<h1>Panorama Reconstruct (WebGPU 版)</h1>
+<h1>アニメキャプつなぎ Panorama Reconstruct (WebGPU版)</h1>
 <div id="gpuStatus" class="banner" hidden></div>
   <div id="drop" class="drop">
   <div class="row"><input type="file" id="file" accept="video/*,image/*" multiple> <span id="fileInfo" class="hint"></span></div>
-  <div class="hint">動画 1 本、またはフレーム画像を複数選択。ここに動画ファイルやフレーム画像をドロップしても可</div>
+  <div class="hint">動画1ファイル、または重ね合わせ部分のある画像を複数選択。ここに動画ファイルやフレーム画像をドロップしても可</div>
   <div class="row" style="margin-top:6px">
     <button id="run" class="primary">実行</button>
     <button id="cancel" disabled>中断</button>
@@ -75,7 +75,7 @@
 <div>
   <div class="row" style="margin:6px 0 8px">
     <label style="min-width:auto"><input type="checkbox" id="staticMask"> 静止オーバーレイ検出</label>
-    <span class="hint">既定は無効。テロップ（画面に固定された文字・ロゴ）を消したい場合に有効にする。有効時はズーム中心付近の動かない細線をテロップと誤判定して消すことがあるので、細線が消えるなら span を大きく</span>
+    <span class="hint">テロップ（画面に固定された文字・ロゴ）を消したい場合に有効にする。有効時はズーム中心付近の動かない細線をテロップと誤判定して消すことがあるので、細線が消えるなら span を大きく</span>
   </div>
   <details id="params">
   <summary>パラメータ</summary>
