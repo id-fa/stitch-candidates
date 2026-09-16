@@ -1,6 +1,6 @@
 // trim.js - 動画のトリム（開始/終了フレーム）、クロップ、無視矩形/テキスト矩形をプレビュー上で指定するパネル
 //
-// - 範囲バーの両端ハンドルをドラッグして大まかに指定し、-1 / +1 で 1 フレーム単位に微調整
+// - 範囲バーの両端ハンドルをドラッグして大まかに指定し、-1 / +1 ボタンまたはバー上でのホイールで 1 フレーム単位に微調整
 // - 開始フレームと終了フレームを <video> 2 本で並べて表示（シークで追従）
 // - プレビュー上のドラッグで矩形を描く。モード: crop（1 個、ハンドルで拡縮・内側ドラッグで移動）、ignore / text（複数）
 // - フレームレートは requestVideoFrameCallback で実測（取れなければ fallback 値）。フレーム番号は t*fps の近似
@@ -128,6 +128,14 @@ export class TrimPanel {
     });
     this.bar.addEventListener("pointermove", (e) => { if (this.barActive) this.set(this.barActive, this._barFrame(e)); });
     this.bar.addEventListener("pointerup", () => { this.barActive = null; });
+    // ホイール: バー上にカーソルがあるときだけ、カーソルに近い方のハンドルを 1 フレーム動かす（下 = +1, 上 = -1）
+    this.bar.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      if (!this.n) return;
+      const f = this._barFrame(e);
+      const which = Math.abs(f - this.start) <= Math.abs(f - this.end) ? "start" : "end";
+      this.step(which, e.deltaY > 0 ? 1 : -1);
+    }, { passive: false });
     // プレビュー上の矩形操作
     this.overlays.forEach((cv, i) => {
       cv.addEventListener("pointerdown", (e) => this._onPress(e, cv));
