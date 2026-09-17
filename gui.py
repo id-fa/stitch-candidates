@@ -1049,8 +1049,9 @@ class PanoramaTab(ttk.Frame):
         mf = ttk.Frame(f)
         mf.pack(fill=tk.X, padx=4, pady=2)
         ttk.Label(mf, text="Model:").pack(side=tk.LEFT)
-        self.model_var = tk.StringVar(value="scale")
-        for m, lbl in (("translation", "Translation"), ("scale", "Scale (zoom)"), ("similarity", "Similarity (+rotation)")):
+        self.model_var = tk.StringVar(value="")
+        for m, lbl in (("", "Auto (scale; homography if live action)"), ("translation", "Translation"), ("scale", "Scale (zoom)"),
+                       ("similarity", "Similarity (+rotation)"), ("homography", "Homography (perspective)")):
             ttk.Radiobutton(mf, text=lbl, variable=self.model_var, value=m).pack(side=tk.LEFT, padx=6)
         zf = ttk.Frame(f)
         zf.pack(fill=tk.X, padx=4, pady=2)
@@ -1085,6 +1086,68 @@ class PanoramaTab(ttk.Frame):
         self.text_halo_entry = LabeledEntry(tf, "Text halo:", "4", width=5,
                                             tooltip="Grow the text mask inside text rects by this many px")
         self.text_halo_entry.pack(side=tk.LEFT, padx=(12, 0))
+
+        # --- Live action ---
+        f = ttk.LabelFrame(pf, text="Live Action (実写に特化)")
+        f.pack(fill=tk.X, padx=4, pady=2)
+        lf = ttk.Frame(f)
+        lf.pack(fill=tk.X, padx=4, pady=2)
+        self.live_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(lf, text="Live action (実写に特化)", variable=self.live_var).pack(side=tk.LEFT)
+        ttk.Label(lf, text="Switches the defaults below to: homography model, auto projection, lens k1 auto, frame quality on, "
+                           "sharp sigma 1, blend-frame detect on, deinterlace auto, exposure on + vignette, motion reject on. "
+                           "Each field set to something other than 'default' overrides it (also usable for anime).",
+                  foreground="gray", wraplength=900, justify=tk.LEFT).pack(side=tk.LEFT, padx=(12, 0))
+        l1 = ttk.Frame(f)
+        l1.pack(fill=tk.X, padx=4, pady=2)
+        ttk.Label(l1, text="Projection:").pack(side=tk.LEFT)
+        self.projection_var = tk.StringVar(value="default")
+        ttk.Combobox(l1, textvariable=self.projection_var, values=["default", "auto", "planar", "cylindrical"],
+                     state="readonly", width=10).pack(side=tk.LEFT, padx=(4, 0))
+        self.cyl_span_entry = LabeledEntry(l1, "Cyl min span (deg):", "35", width=5,
+                                           tooltip="projection=auto switches to cylindrical when the pan angle exceeds this")
+        self.cyl_span_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.focal_entry = LabeledEntry(l1, "Focal px:", "", width=7, tooltip="Focal length in px for cylindrical projection. Empty = estimate")
+        self.focal_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.lens_entry = LabeledEntry(l1, "Lens k1:", "", width=8,
+                                       tooltip="Radial distortion: empty = default (auto if live action, else off), auto, off, or a number "
+                                               "(negative = barrel). Frames are undistorted before alignment")
+        self.lens_entry.pack(side=tk.LEFT, padx=(12, 0))
+        l2 = ttk.Frame(f)
+        l2.pack(fill=tk.X, padx=4, pady=2)
+        ttk.Label(l2, text="Frame quality:").pack(side=tk.LEFT)
+        self.quality_var = tk.StringVar(value="default")
+        ttk.Combobox(l2, textvariable=self.quality_var, values=["default", "on", "off"], state="readonly", width=8).pack(side=tk.LEFT, padx=(4, 0))
+        self.quality_thr_entry = LabeledEntry(l2, "Thr:", "0.75", width=5,
+                                              tooltip="Frames whose relative sharpness is below this ratio of their neighbours are blurred/shaken")
+        self.quality_thr_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.quality_win_entry = LabeledEntry(l2, "Window:", "8", width=4, tooltip="Neighbour frames (+-N) used as the sharpness baseline")
+        self.quality_win_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.quality_min_entry = LabeledEntry(l2, "Min samples:", "3", width=4,
+                                              tooltip="Blurred frames are dropped only where at least this many good samples remain")
+        self.quality_min_entry.pack(side=tk.LEFT, padx=(12, 0))
+        self.sharp_sigma_entry = LabeledEntry(l2, "Sharp sigma:", "", width=5,
+                                              tooltip="Gaussian blur before the sharpness map so noise/grain is not mistaken for detail. "
+                                                      "Empty = default (1.0 if live action, else 0)")
+        self.sharp_sigma_entry.pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(l2, text="Blend detect:").pack(side=tk.LEFT, padx=(12, 0))
+        self.blend_var = tk.StringVar(value="default")
+        ttk.Combobox(l2, textvariable=self.blend_var, values=["default", "on", "off"], state="readonly", width=8).pack(side=tk.LEFT, padx=(4, 0))
+        self.blend_thr_entry = LabeledEntry(l2, "Thr:", "0.4", width=5, tooltip="Blend-frame test rho threshold (frame explained by a mix of its neighbours)")
+        self.blend_thr_entry.pack(side=tk.LEFT, padx=(12, 0))
+        l3 = ttk.Frame(f)
+        l3.pack(fill=tk.X, padx=4, pady=2)
+        ttk.Label(l3, text="Deinterlace:").pack(side=tk.LEFT)
+        self.deinterlace_var = tk.StringVar(value="default")
+        ttk.Combobox(l3, textvariable=self.deinterlace_var, values=["default", "auto", "on", "off"], state="readonly", width=8).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(l3, text="Vignette (radial gain):").pack(side=tk.LEFT, padx=(12, 0))
+        self.radial_var = tk.StringVar(value="default")
+        ttk.Combobox(l3, textvariable=self.radial_var, values=["default", "on", "off"], state="readonly", width=8).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(l3, text="Motion reject:").pack(side=tk.LEFT, padx=(12, 0))
+        self.motion_var = tk.StringVar(value="default")
+        ttk.Combobox(l3, textvariable=self.motion_var, values=["default", "on", "off"], state="readonly", width=8).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(l3, text="Motion reject: per pixel, pick the value cluster spread over the wider time range as background "
+                           "(slow passing objects); a stopped object still needs Anchor frame", foreground="gray").pack(side=tk.LEFT, padx=(12, 0))
 
         # --- Static overlay ---
         f = ttk.LabelFrame(pf, text="Static Overlay Detection (credits / logos)")
@@ -1151,8 +1214,9 @@ class PanoramaTab(ttk.Frame):
         self.exposure_var = tk.StringVar(value="auto")
         ttk.Combobox(xf, textvariable=self.exposure_var, values=["auto", "on", "off"],
                      state="readonly", width=6).pack(side=tk.LEFT, padx=(4, 0))
-        self.exposure_profile_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(xf, text="Profile (vignette)", variable=self.exposure_profile_var).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(xf, text="Screen profile:").pack(side=tk.LEFT, padx=(12, 0))
+        self.exposure_profile_var = tk.StringVar(value="default")
+        ttk.Combobox(xf, textvariable=self.exposure_profile_var, values=["default", "on", "off"], state="readonly", width=8).pack(side=tk.LEFT, padx=(4, 0))
         self.exposure_min_score_entry = LabeledEntry(xf, "Min score:", "0.2", width=5,
                                                      tooltip="Minimum pair match score used for exposure estimation")
         self.exposure_min_score_entry.pack(side=tk.LEFT, padx=(12, 0))
@@ -1283,7 +1347,38 @@ class PanoramaTab(ttk.Frame):
         if self.no_render_var.get():
             argv += ["--no-render"]
 
-        argv += ["--model", self.model_var.get()]
+        if self.model_var.get():
+            argv += ["--model", self.model_var.get()]
+        if self.live_var.get():
+            argv += ["--live-action"]
+        if self.projection_var.get() != "default":
+            argv += ["--projection", self.projection_var.get()]
+        if self.cyl_span_entry.get():
+            argv += ["--cyl-min-span", self.cyl_span_entry.get()]
+        if self.focal_entry.get():
+            argv += ["--focal", self.focal_entry.get()]
+        if self.lens_entry.get():
+            argv += ["--lens-k1", self.lens_entry.get()]
+        if self.quality_var.get() != "default":
+            argv += ["--quality", self.quality_var.get()]
+        if self.quality_thr_entry.get():
+            argv += ["--quality-thr", self.quality_thr_entry.get()]
+        if self.quality_win_entry.get():
+            argv += ["--quality-window", self.quality_win_entry.get()]
+        if self.quality_min_entry.get():
+            argv += ["--quality-min-samples", self.quality_min_entry.get()]
+        if self.sharp_sigma_entry.get():
+            argv += ["--sharp-sigma", self.sharp_sigma_entry.get()]
+        if self.blend_var.get() != "default":
+            argv += ["--blend-detect", self.blend_var.get()]
+        if self.blend_thr_entry.get():
+            argv += ["--blend-thr", self.blend_thr_entry.get()]
+        if self.deinterlace_var.get() != "default":
+            argv += ["--deinterlace", self.deinterlace_var.get()]
+        if self.radial_var.get() != "default":
+            argv += ["--exposure-radial", self.radial_var.get()]
+        if self.motion_var.get() != "default":
+            argv += ["--motion-reject", self.motion_var.get()]
         if self.scale_max_entry.get():
             argv += ["--scale-max", self.scale_max_entry.get()]
         if self.scale_step_entry.get():
@@ -1350,7 +1445,8 @@ class PanoramaTab(ttk.Frame):
         if self.min_clean_pct_entry.get():
             argv += ["--min-clean-pct", self.min_clean_pct_entry.get()]
         argv += ["--exposure", self.exposure_var.get()]
-        argv += ["--exposure-profile", "on" if self.exposure_profile_var.get() else "off"]
+        if self.exposure_profile_var.get() != "default":
+            argv += ["--exposure-profile", self.exposure_profile_var.get()]
         if self.exposure_min_score_entry.get():
             argv += ["--exposure-min-score", self.exposure_min_score_entry.get()]
         if self.exposure_local_entry.get():

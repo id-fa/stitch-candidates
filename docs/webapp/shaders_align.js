@@ -344,3 +344,235 @@ fn main(@builtin(local_invocation_id) l: vec3<u32>) {
   }
 }`,
 };
+
+// ------------------------------------------------------------ ホモグラフィ（8 自由度）+ 任意で放射歪み k1 の Gauss-Newton
+// 状態 state[slot*16 + ...] = (g0..g7, score, n_valid, fail, conv, k1, -, -, -)。G は正規化座標で x_j = π(G x_i)。
+// 正規化座標: xn = (x - cx_lv) / f_lv、f_lv = lv f_full（全レベルで同じ座標）。use_k1=1 なら A の画素を歪み除去 → G → 歪み付与して B をサンプル
+// （A を再標本化しないので、補正画像のぼけで残差が減る方向に k1 が引かれない）。k1 の微分は数値微分（eps）
+const GNH_COMMON = /* wgsl */ `
+struct P { hs: u32, ws: u32, hb: u32, wb: u32, lv: f32, slot: u32, nbins: u32, rmax: f32, nwg: u32, last: u32, use_k1: u32,
+           f_full: f32, cx_full: f32, cy_full: f32, kap_scale: f32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> A: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> B: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read_write> hist: array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> partials: array<f32>;
+@group(0) @binding(5) var<storage, read_write> state: array<f32>;
+
+fn sampB(Wx: f32, Wy: f32) -> vec4<f32> {
+  let wb = i32(p.wb); let hb = i32(p.hb);
+  let x0f = floor(Wx); let y0f = floor(Wy);
+  let fx = Wx - x0f; let fy = Wy - y0f;
+  let x0 = i32(x0f); let y0 = i32(y0f);
+  var acc = vec4<f32>(0.0);
+  for (var t = 0; t < 4; t++) {
+    let xi = x0 + (t & 1); let yi = y0 + (t >> 1);
+    let w = select(1.0 - fx, fx, (t & 1) == 1) * select(1.0 - fy, fy, (t >> 1) == 1);
+    if (xi >= 0 && xi < wb && yi >= 0 && yi < hb && w > 0.0) {
+      let c = B[yi * wb + xi];
+      let gx = 0.5 * (B[yi * wb + min(xi + 1, wb - 1)].x - B[yi * wb + max(xi - 1, 0)].x);
+      let gy = 0.5 * (B[min(yi + 1, hb - 1) * wb + xi].x - B[max(yi - 1, 0) * wb + xi].x);
+      acc += w * vec4<f32>(c.x, c.y, gx, gy);
+    }
+  }
+  return acc;
+}
+// A のレベル画素 (x, y) → 正規化 (xu, yu)（歪み除去後）→ G → (un, vn), Z → B のレベル画素 (Wx, Wy)（歪み付与後）
+struct Map { xu: f32, yu: f32, un: f32, vn: f32, Z: f32, Wx: f32, Wy: f32 }
+fn map_px(x: f32, y: f32, base: u32, k1: f32) -> Map {
+  let f_lv = p.lv * p.f_full;
+  let cx_lv = p.lv * (p.cx_full + 0.5) - 0.5; let cy_lv = p.lv * (p.cy_full + 0.5) - 0.5;
+  let xdn = (x - cx_lv) / f_lv; let ydn = (y - cy_lv) / f_lv;
+  var xu = xdn; var yu = ydn;
+  let kap = k1 * p.kap_scale;
+  if (p.use_k1 == 1u) {
+    for (var t = 0; t < 6; t++) { let r2 = xu * xu + yu * yu; xu = xdn / (1.0 + kap * r2); yu = ydn / (1.0 + kap * r2); }
+  }
+  let g0 = state[base]; let g1 = state[base + 1u]; let g2 = state[base + 2u];
+  let g3 = state[base + 3u]; let g4 = state[base + 4u]; let g5 = state[base + 5u];
+  let g6 = state[base + 6u]; let g7 = state[base + 7u];
+  var Z = g6 * xu + g7 * yu + 1.0;
+  let Zs = select(Z, 1e-6, abs(Z) < 1e-6);
+  let un = (g0 * xu + g1 * yu + g2) / Zs;
+  let vn = (g3 * xu + g4 * yu + g5) / Zs;
+  var fct = 1.0;
+  if (p.use_k1 == 1u) { fct = 1.0 + kap * (un * un + vn * vn); }
+  return Map(xu, yu, un, vn, Zs, un * fct * f_lv + cx_lv, vn * fct * f_lv + cy_lv);
+}
+fn inside_b(mp: Map) -> bool {
+  return mp.Wx >= 0.0 && mp.Wx <= f32(p.wb - 1u) && mp.Wy >= 0.0 && mp.Wy <= f32(p.hb - 1u) && mp.Z > 0.05;
+}
+`;
+
+ALIGN.gnh_resid = {
+  fields: [["hs", "u32"], ["ws", "u32"], ["hb", "u32"], ["wb", "u32"], ["lv", "f32"], ["slot", "u32"], ["nbins", "u32"],
+           ["rmax", "f32"], ["nwg", "u32"], ["last", "u32"], ["use_k1", "u32"], ["f_full", "f32"], ["cx_full", "f32"], ["cy_full", "f32"], ["kap_scale", "f32"]],
+  bindings: ["r", "r", "rw", "rw", "rw"], wg: [128, 1, 1],
+  code: GNH_COMMON + /* wgsl */ `
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let base = p.slot * 16u;
+  if (state[base + 10u] > 0.5 || state[base + 11u] > 0.5) { return; }
+  let k1 = state[base + 12u];
+  let n = p.hs * p.ws;
+  let stride = p.nwg * 128u;
+  for (var i = g.x; i < n; i += stride) {
+    let x = f32(i % p.ws); let y = f32(i / p.ws);
+    let mp = map_px(x, y, base, k1);
+    if (!inside_b(mp)) { continue; }
+    let a = A[i];
+    if (a.y <= 0.5) { continue; }
+    let sb = sampB(mp.Wx, mp.Wy);
+    if (sb.y <= 0.5) { continue; }
+    let r = a.x - sb.x;
+    let bin = min(p.nbins - 1u, u32(abs(r) * f32(p.nbins) / p.rmax));
+    atomicAdd(&hist[bin], 1u);
+    atomicAdd(&hist[p.nbins], 1u);
+  }
+}`,
+};
+
+// 部分和 partials[wg*60 + q]: q = 9x9 上三角 45 個, g 9 個, スコア和 5 個 (a, b, aa, bb, ab), 個数 1
+ALIGN.gnh_accum = {
+  fields: ALIGN.gnh_resid.fields,
+  bindings: ["r", "r", "rw", "rw", "rw"], wg: [64, 1, 1],
+  code: GNH_COMMON + /* wgsl */ `
+var<workgroup> red: array<f32, 3840>;
+var<workgroup> cth_s: f32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+  let base = p.slot * 16u;
+  let skip = max(state[base + 10u], state[base + 11u]) > 0.5;
+  if (l.x == 0u) {
+    let cnt = atomicLoad(&hist[p.nbins]);
+    let tgt = select(0u, (cnt - 1u) / 2u, cnt > 0u);
+    var cum = 0u; var b = 0u;
+    for (; b < p.nbins; b++) { cum += atomicLoad(&hist[b]); if (cum > tgt) { break; } }
+    let med = (f32(min(b, p.nbins - 1u)) + 0.5) * p.rmax / f32(p.nbins);
+    cth_s = 1.345 * (med * 1.4826 + 1e-6);
+  }
+  workgroupBarrier();
+  let cth = cth_s;
+  var acc: array<f32, 60>;
+  for (var q = 0u; q < 60u; q++) { acc[q] = 0.0; }
+  if (!skip) {
+    let k1 = state[base + 12u];
+    let f_lv = p.lv * p.f_full;
+    let eps_k = 2e-3;
+    let n = p.hs * p.ws;
+    let stride = p.nwg * 64u;
+    let NP = select(8u, 9u, p.use_k1 == 1u);
+    for (var i = g.x; i < n; i += stride) {
+      let x = f32(i % p.ws); let y = f32(i / p.ws);
+      let mp = map_px(x, y, base, k1);
+      if (!inside_b(mp)) { continue; }
+      let a = A[i];
+      if (a.y <= 0.5) { continue; }
+      let sb = sampB(mp.Wx, mp.Wy);
+      if (sb.y <= 0.5) { continue; }
+      let r = a.x - sb.x;
+      let bx = sb.z * f_lv; let by = sb.w * f_lv;
+      let iz = 1.0 / mp.Z;
+      var J: array<f32, 9>;
+      J[0] = bx * mp.xu * iz; J[1] = bx * mp.yu * iz; J[2] = bx * iz;
+      J[3] = by * mp.xu * iz; J[4] = by * mp.yu * iz; J[5] = by * iz;
+      let t = bx * mp.un + by * mp.vn;
+      J[6] = -t * mp.xu * iz; J[7] = -t * mp.yu * iz;
+      J[8] = 0.0;
+      if (p.use_k1 == 1u) {
+        let mp2 = map_px(x, y, base, k1 + eps_k);
+        let sb2 = sampB(mp2.Wx, mp2.Wy);
+        let r2 = a.x - sb2.x;
+        J[8] = -(r2 - r) / eps_k;
+      }
+      let ar = abs(r);
+      let w = select(cth / max(ar, 1e-12), 1.0, ar <= cth);
+      var q = 0u;
+      for (var i1 = 0u; i1 < NP; i1++) {
+        for (var i2 = i1; i2 < 9u; i2++) { if (i2 < NP) { acc[i1 * 9u - (i1 * (i1 + 1u)) / 2u + i2] += w * J[i1] * J[i2]; } }
+      }
+      for (var i1 = 0u; i1 < NP; i1++) { acc[45u + i1] += w * J[i1] * r; }
+      acc[54] += a.x; acc[55] += sb.x; acc[56] += a.x * a.x; acc[57] += sb.x * sb.x; acc[58] += a.x * sb.x;
+      acc[59] += 1.0;
+    }
+  }
+  for (var q = 0u; q < 60u; q++) { red[l.x * 60u + q] = acc[q]; }
+  workgroupBarrier();
+  for (var st = 32u; st > 0u; st >>= 1u) {
+    if (l.x < st) { for (var q = 0u; q < 60u; q++) { red[l.x * 60u + q] += red[(l.x + st) * 60u + q]; } }
+    workgroupBarrier();
+  }
+  if (l.x == 0u) { for (var q = 0u; q < 60u; q++) { partials[wid.x * 60u + q] = red[q]; } }
+}`,
+};
+
+ALIGN.gnh_solve = {
+  fields: ALIGN.gnh_resid.fields,
+  bindings: ["r", "r", "rw", "rw", "rw"], wg: [64, 1, 1],
+  code: GNH_COMMON + /* wgsl */ `
+var<workgroup> red: array<f32, 3840>;
+fn hidx(i1: u32, i2: u32) -> u32 {
+  let a = min(i1, i2); let b = max(i1, i2);
+  return a * 9u - (a * (a + 1u)) / 2u + b;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) l: vec3<u32>) {
+  var acc: array<f32, 60>;
+  for (var q = 0u; q < 60u; q++) { acc[q] = 0.0; }
+  for (var w = l.x; w < p.nwg; w += 64u) { for (var q = 0u; q < 60u; q++) { acc[q] += partials[w * 60u + q]; } }
+  for (var q = 0u; q < 60u; q++) { red[l.x * 60u + q] = acc[q]; }
+  workgroupBarrier();
+  for (var st = 32u; st > 0u; st >>= 1u) {
+    if (l.x < st) { for (var q = 0u; q < 60u; q++) { red[l.x * 60u + q] += red[(l.x + st) * 60u + q]; } }
+    workgroupBarrier();
+  }
+  if (l.x != 0u) { return; }
+  let base = p.slot * 16u;
+  if (state[base + 10u] > 0.5) { return; }
+  if (state[base + 11u] > 0.5) { if (p.last == 1u) { state[base + 11u] = 0.0; } return; }
+  let n = red[59];
+  if (n < 0.02 * f32(p.hs * p.ws)) { state[base + 10u] = 1.0; return; }
+  let sa = red[54]; let sb = red[55]; let saa = red[56]; let sbb = red[57]; let sab = red[58];
+  let num = sab - sa * sb / n;
+  let den = sqrt(max(saa - sa * sa / n, 0.0) * max(sbb - sb * sb / n, 0.0)) + 1e-12;
+  state[base + 8u] = num / den;
+  state[base + 9u] = n;
+  let NP = select(8u, 9u, p.use_k1 == 1u);
+  var M: array<f32, 90>; // 9x10 拡大行列
+  for (var a = 0u; a < NP; a++) {
+    let d = red[hidx(a, a)];
+    for (var b = 0u; b < NP; b++) { M[a * 10u + b] = red[hidx(a, b)] + select(0.0, d * 1e-4 + 1e-12, a == b); }
+    M[a * 10u + 9u] = red[45u + a];
+  }
+  var ok = true;
+  for (var c = 0u; c < NP; c++) {
+    var piv = c; var pv = abs(M[c * 10u + c]);
+    for (var r = c + 1u; r < NP; r++) { if (abs(M[r * 10u + c]) > pv) { pv = abs(M[r * 10u + c]); piv = r; } }
+    if (pv < 1e-30) { ok = false; break; }
+    if (piv != c) { for (var k = 0u; k < 10u; k++) { let t = M[c * 10u + k]; M[c * 10u + k] = M[piv * 10u + k]; M[piv * 10u + k] = t; } }
+    for (var r = 0u; r < NP; r++) {
+      if (r == c) { continue; }
+      let f = M[r * 10u + c] / M[c * 10u + c];
+      for (var k = c; k < 10u; k++) { M[r * 10u + k] -= f * M[c * 10u + k]; }
+    }
+  }
+  var upd: array<f32, 9>;
+  var mx = 0.0;
+  if (ok) {
+    for (var a = 0u; a < NP; a++) {
+      let d = M[a * 10u + 9u] / M[a * 10u + a];
+      if (d != d || abs(d) > 1e30) { ok = false; }
+      upd[a] = d;
+      if (a < 8u) { mx = max(mx, abs(d)); }
+    }
+  }
+  if (!ok) { state[base + 10u] = 1.0; return; }
+  for (var a = 0u; a < 8u; a++) { state[base + a] += upd[a]; }
+  var conv = mx < 3e-6;
+  if (p.use_k1 == 1u) {
+    state[base + 12u] = clamp(state[base + 12u] + upd[8], -0.6, 0.6);
+    conv = conv && abs(upd[8]) < 1e-5;
+  }
+  if (conv && p.last == 0u) { state[base + 11u] = 1.0; }
+}`,
+};

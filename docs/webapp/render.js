@@ -7,6 +7,7 @@
 
 import { RENDER } from "./shaders_render.js";
 import { fmtMB } from "./gpu.js";
+import { mat3mul, mat3inv, mat3T, applyH } from "./solve.js";
 
 const now = () => performance.now() / 1000;
 
@@ -14,6 +15,20 @@ function corners(S, TH, T, k, H, W) {
   const c = Math.cos(TH[k]), s = Math.sin(TH[k]);
   const pts = [[-0.5, -0.5], [W - 0.5, -0.5], [-0.5, H - 0.5], [W - 0.5, H - 0.5]];
   return pts.map(([x, y]) => [S[k] * (c * x - s * y) + T[k * 2], S[k] * (s * x + c * y) + T[k * 2 + 1]]);
+}
+// 投影の種類ごとのフレーム → キャンバス（ホモグラフィ / 円筒）。境界を細かくサンプルして外接矩形を得る
+function boundaryPts(W, H, m = 32) {
+  const pts = [];
+  for (let t = 0; t <= m; t++) {
+    const x = -0.5 + t * W / m, y = -0.5 + t * H / m;
+    pts.push([x, -0.5], [x, H - 0.5], [-0.5, y], [W - 0.5, y]);
+  }
+  return pts;
+}
+function cylToCanvas(Ki, R, fc, X0, Y0, x, y) {
+  const d = [Ki[0] * x + Ki[1] * y + Ki[2], Ki[3] * x + Ki[4] * y + Ki[5], 1];
+  const dw = [R[0] * d[0] + R[1] * d[1] + R[2] * d[2], R[3] * d[0] + R[4] * d[1] + R[5] * d[2], R[6] * d[0] + R[7] * d[1] + R[8] * d[2]];
+  return [fc * Math.atan2(dw[0], dw[2]) + X0, fc * dw[1] / Math.hypot(dw[0], dw[2]) + Y0];
 }
 
 /**
@@ -26,21 +41,49 @@ export async function render(rc, al) {
   for (const [name, def] of Object.entries(RENDER)) K[name] = g.kernel(name, def.code, def.fields, def.bindings, def.wg);
   const S = Float64Array.from(al.S), TH = Float64Array.from(al.TH), T = Float64Array.from(al.T);
   const sizes = rc.sizes;   // 各フレームの有効サイズ [w, h]（パディングはキャンバスに含めない）
+  const kind = al.kind || "sim";
   const gsc = a.canvasScale === "auto" ? 1.0 / Math.min(...S) : Number(a.canvasScale);
   for (let k = 0; k < n; k++) { S[k] *= gsc; T[k * 2] *= gsc; T[k * 2 + 1] *= gsc; }
+  // 投影ごとのフレーム → キャンバス（倍率 gsc、原点移動 (ox, oy) 適用後）
+  let Hm = null, Ki = null, fc = 0, X0 = 0, Y0 = 0;
+  if (kind === "homography") Hm = al.Hm.map((Hk) => mat3mul(Float64Array.from([gsc, 0, 0, 0, gsc, 0, 0, 0, 1]), Hk));
+  if (kind === "cyl") { Ki = mat3inv(al.K); fc = al.fc * gsc; }
+  const cornersOf = (k) => {
+    if (kind === "sim") return corners(S, TH, T, k, sizes[k][1], sizes[k][0]);
+    const pts = boundaryPts(sizes[k][0], sizes[k][1]);
+    if (kind === "homography") return pts.map(([x, y]) => applyH(Hm[k], x, y));
+    return pts.map(([x, y]) => cylToCanvas(Ki, al.R[k], fc, X0, Y0, x, y));
+  };
   let minX = Infinity, minY = Infinity;
-  for (let k = 0; k < n; k++) for (const [x, y] of corners(S, TH, T, k, sizes[k][1], sizes[k][0])) { minX = Math.min(minX, x); minY = Math.min(minY, y); }
+  for (let k = 0; k < n; k++) for (const [x, y] of cornersOf(k)) { minX = Math.min(minX, x); minY = Math.min(minY, y); }
   const ox = Math.floor(minX + 0.5), oy = Math.floor(minY + 0.5);
   for (let k = 0; k < n; k++) { T[k * 2] -= ox; T[k * 2 + 1] -= oy; }
+  if (kind === "homography") Hm = Hm.map((Hk) => mat3mul(Float64Array.from([1, 0, -ox, 0, 1, -oy, 0, 0, 1]), Hk));
+  if (kind === "cyl") { X0 = -ox; Y0 = -oy; }
+  // キャンバス → フレーム（ぼかしの行範囲の見積もり用）
+  const toFrame = (k, X, Y) => {
+    if (kind === "sim") {
+      const s = S[k], c = Math.cos(TH[k]), sn = Math.sin(TH[k]);
+      const u = (X - T[k * 2]) / s, v = (Y - T[k * 2 + 1]) / s;
+      return [c * u + sn * v, -sn * u + c * v];
+    }
+    if (kind === "homography") return applyH(mat3inv(Hm[k]), X, Y);
+    const th = (X - X0) / fc, hh = (Y - Y0) / fc;
+    const d = [Math.sin(th), hh, Math.cos(th)];
+    const M = mat3mul(al.K, mat3T(al.R[k]));
+    const qz = M[6] * d[0] + M[7] * d[1] + M[8] * d[2];
+    return [(M[0] * d[0] + M[1] * d[1] + M[2] * d[2]) / qz, (M[3] * d[0] + M[4] * d[1] + M[5] * d[2]) / qz];
+  };
   const boxes = [];
   let maxX = -Infinity, maxY = -Infinity;
   for (let k = 0; k < n; k++) {
-    const cs = corners(S, TH, T, k, sizes[k][1], sizes[k][0]);
+    const cs = cornersOf(k);
     const b = { x0: Math.min(...cs.map((p) => p[0])), x1: Math.max(...cs.map((p) => p[0])),
                 y0: Math.min(...cs.map((p) => p[1])), y1: Math.max(...cs.map((p) => p[1])) };
     boxes.push(b); maxX = Math.max(maxX, b.x1); maxY = Math.max(maxY, b.y1);
   }
   const Wc = Math.ceil(maxX + 0.5), Hc = Math.ceil(maxY + 0.5);
+  if (Wc * Hc > 400000000) throw new Error(`キャンバス ${Wc}x${Hc} が大きすぎます（projection を cylindrical にするか canvas scale を下げてください）`);
   const outBytes = Wc * Hc * 4;
   const lim = g.device.limits.maxStorageBufferBindingSize;
   if (outBytes > lim) throw new Error(`キャンバス ${Wc}x${Hc} が大きすぎます（${(outBytes / 1048576).toFixed(0)}MB > ${(lim / 1048576).toFixed(0)}MB）。canvas scale を下げてください`);
@@ -106,8 +149,11 @@ export async function render(rc, al) {
   }
   if (cacheFrames < st.maxResident) { st.setMaxResident(cacheFrames); rc.log(`[render] フレームキャッシュを ${cacheFrames} 枚に縮小`); }
   const { bw, tiles, Kmax } = sel;
-  rc.log(`[render] canvas ${Wc}x${Hc}, canvas scale=${gsc.toFixed(4)}, ${horiz ? "column" : "row"} bands of ${bw}px (${tiles.length}), ` +
-         `max ${Kmax} frames/band, res tol=${a.resTol}` + (anchor ? `, anchor frames ${anchor[0]}-${anchor[1]}` : ""));
+  const tiers = rc.frameTier;
+  const useTier = !!(tiers && tiers.some((t) => t > 0));
+  rc.log(`[render] canvas ${Wc}x${Hc}, canvas scale=${gsc.toFixed(4)}, projection=${kind}, ${horiz ? "column" : "row"} bands of ${bw}px (${tiles.length}), ` +
+         `max ${Kmax} frames/band, res tol=${a.resTol}` + (anchor ? `, anchor frames ${anchor[0]}-${anchor[1]}` : "") +
+         (useTier ? `, quality tiers (min samples ${a.qualityMin})` : "") + (a.motionReject ? ", motion reject" : ""));
   const need = needOf(sel);
   g.reserve(need, `render (canvas ${Wc}x${Hc})`);
   const t0 = now();
@@ -115,23 +161,28 @@ export async function render(rc, al) {
   const outMed = g.buf(outBytes, "out_med"), outMean = g.buf(outBytes, "out_mean"), outSharp = g.buf(outBytes, "out_sharp"), outCov = g.buf(outBytes, "out_cov");
   const outBlend = g.buf(outBytes, "out_blend");
   const tmp1 = g.buf(W * H * 16, "blur_tmp1"), tmp2 = g.buf(W * H * 16, "blur_tmp2");
+  const tiersBuf = g.buf(Math.max(16, Kmax * 4), "tiers");
   // 露出補正: プロファイル（節点 + f(y) + g(x)）と局所場（フレームごとの格子）を 1 つのバッファ（0..255 単位）で渡し、
   // フレームごとのゲイン / オフセットは uniform
   const ex = rc.exposure;
-  let expoBuf = g.zero, nk = 0, gxg = 0, gyg = 0, NG = 0, locBase = 0;
-  if (ex && (ex.profile || ex.local)) {
+  let expoBuf = g.zero, nk = 0, gxg = 0, gyg = 0, NG = 0, locBase = 0, nr = 0, radOff = 0;
+  if (ex && (ex.profile || ex.local || ex.radial)) {
     nk = ex.profile ? ex.knots.length : 0;
     if (ex.local) { [gxg, gyg] = ex.localGrid; NG = (gxg + 1) * (gyg + 1); }
+    nr = ex.radial ? ex.rknots.length : 0;
     locBase = nk + 2 * nk * 3;
-    const arr = new Float32Array(locBase + n * NG * 3);
+    radOff = locBase + n * NG * 3;
+    const arr = new Float32Array(radOff + nr + nr * 3);
     for (let q = 0; q < nk; q++) arr[q] = ex.knots[q];
     for (let q = 0; q < nk * 3; q++) { arr[nk + q] = ex.profile.fy[q] * 255; arr[nk + nk * 3 + q] = ex.profile.gx[q] * 255; }
     for (let q = 0; q < n * NG * 3; q++) arr[locBase + q] = ex.local[q] * 255;
+    for (let q = 0; q < nr; q++) arr[radOff + q] = ex.rknots[q];
+    for (let q = 0; q < nr * 3; q++) arr[radOff + nr + q] = ex.radial[q];     // 比（×255 しない）
     expoBuf = g.buf(arr.byteLength, "expo");
     g.upload(expoBuf, arr);
   }
   const feather = Math.max(0, a.feather || 0);
-  if (ex) rc.log(`[render] 露出補正を適用（ゲイン / オフセット${ex.profile ? " + 周辺プロファイル" : ""}${ex.local ? ` + 局所場 ${gxg}x${gyg}` : ""}）` +
+  if (ex) rc.log(`[render] 露出補正を適用（ゲイン / オフセット${ex.profile ? " + 周辺プロファイル" : ""}${ex.local ? ` + 局所場 ${gxg}x${gyg}` : ""}${ex.radial ? " + 周辺減光" : ""}）` +
                  (feather > 0 ? `、フェザー合成 ${feather.toFixed(0)} px` : ""));
   let nb = 0;
   for (const tile of tiles) {
@@ -149,11 +200,11 @@ export async function render(rc, al) {
           const r = Math.min(12, Math.max(1, Math.ceil(3 * sigma)));
           // タイルが参照するフレーム行の範囲
           let fy0 = Infinity, fy1 = -Infinity;
-          for (const [X, Y] of [[x0, y0], [x0 + tw, y0], [x0, y0 + th], [x0 + tw, y0 + th]]) {
-            const u = (X - Tx) / s, v = (Y - Ty) / s;
-            const fy = -sn * u + c * v;
-            fy0 = Math.min(fy0, fy); fy1 = Math.max(fy1, fy);
+          for (const [X, Y] of [[x0, y0], [x0 + tw, y0], [x0, y0 + th], [x0 + tw, y0 + th], [x0 + tw / 2, y0], [x0 + tw / 2, y0 + th]]) {
+            const fy = toFrame(k, X, Y)[1];
+            if (Number.isFinite(fy)) { fy0 = Math.min(fy0, fy); fy1 = Math.max(fy1, fy); }
           }
+          if (kind !== "sim") { fy0 = Math.max(-H, fy0 - 2); fy1 = Math.min(2 * H, fy1 + 2); }
           const r0 = Math.max(0, Math.floor(fy0) - 1), r1 = Math.min(H, Math.ceil(fy1) + 2);
           if (r1 > r0) {
             const e0 = Math.max(0, r0 - r), e1 = Math.min(H, r1 + r);
@@ -164,18 +215,24 @@ export async function render(rc, al) {
         }
         const gain = ex ? [ex.gain[k * 3], ex.gain[k * 3 + 1], ex.gain[k * 3 + 2], 1] : [1, 1, 1, 1];
         const off = ex ? [ex.offset[k * 3] * 255, ex.offset[k * 3 + 1] * 255, ex.offset[k * 3 + 2] * 255, 0] : [0, 0, 0, 0];
+        let proj = 0, m0 = [0, 0, 0, 0], m1 = [0, 0, 0, 0], m2 = [0, 0, 0, 0];
+        if (kind === "homography") { proj = 1; const Hi = mat3inv(Hm[k]); m0 = [Hi[0], Hi[1], Hi[2], 0]; m1 = [Hi[3], Hi[4], Hi[5], 0]; m2 = [Hi[6], Hi[7], Hi[8], 0]; }
+        else if (kind === "cyl") { proj = 2; const M = mat3mul(al.K, mat3T(al.R[k])); m0 = [M[0], M[1], M[2], 0]; m1 = [M[3], M[4], M[5], 0]; m2 = [M[6], M[7], M[8], 0]; }
         K.warp.run2d({ x0, y0, tw, th, W, H, Wq: rc.Wq, Hq: rc.Hq, slot, sharp_off: k * rc.Hq * rc.Wq, use_blur: useBlur, s, c, sn, Tx, Ty, mag_lv: magLevel(s),
-                       vw: sizes[k][0], vh: sizes[k][1], use_expo: ex ? 1 : 0, nk, loc_off: locBase + k * NG * 3, gx: gxg, gy: gyg, feather, gain, off },
+                       vw: sizes[k][0], vh: sizes[k][1], use_expo: ex ? 1 : 0, nk, loc_off: locBase + k * NG * 3, gx: gxg, gy: gyg, feather,
+                       proj, fc, X0, Y0, nr, rad_off: radOff, gain, off, m0, m1, m2 },
           [fr, tmp2, rc.sharpq, stack, expoBuf], tw, th);
       }
+      if (useTier) g.upload(tiersBuf, Uint32Array.from(ks, (k) => tiers[k]));
       // アンカーフレームのスロット範囲（ks は昇順なので連続）。無ければ lo > hi
       let ancLo = 1, ancHi = 0;
       if (anchor) {
         const idx = ks.map((k, i) => (inAnchor(k) ? i : -1)).filter((i) => i >= 0);
         if (idx.length) { ancLo = idx[0]; ancHi = idx[idx.length - 1]; }
       }
-      K.median.run2d({ Wc, x0, y0, tw, th, K: ks.length, tol: a.inlierTol * 255.0, sharp_top: a.sharpTop, res_lv: resLv, anc_lo: ancLo, anc_hi: ancHi },
-        [stack, outMed, outMean, outSharp, outCov, outBlend], tw, th);
+      K.median.run2d({ Wc, x0, y0, tw, th, K: ks.length, tol: a.inlierTol * 255.0, sharp_top: a.sharpTop, res_lv: resLv, anc_lo: ancLo, anc_hi: ancHi,
+                       use_tier: useTier ? 1 : 0, min_q: Math.max(1, a.qualityMin | 0), motion: a.motionReject ? 1 : 0 },
+        [stack, outMed, outMean, outSharp, outCov, outBlend, tiersBuf], tw, th);
     }
     nb++;
     if (nb % 4 === 0) { await g.done(); rc.progress("render", nb / tiles.length); rc._check(); }
@@ -191,7 +248,7 @@ export async function render(rc, al) {
     cov[i] = covRaw[i] & 0xffff; covG[i] = covRaw[i] >>> 16;
     if (covG[i] === 0) holes++; else if (cov[i] === 0) fallback++;
   }
-  for (const b of [stack, outMed, outMean, outSharp, outCov, outBlend, tmp1, tmp2]) g.free(b);
+  for (const b of [stack, outMed, outMean, outSharp, outCov, outBlend, tmp1, tmp2, tiersBuf]) g.free(b);
   if (expoBuf !== g.zero) g.free(expoBuf);
   rc.log(`[render] done ${(now() - t0).toFixed(1)}s, uncovered px=${holes}, fallback (no clean sample) px=${fallback}` +
          (st.allResident ? "" : ` (streaming, ${st.stats()})`));

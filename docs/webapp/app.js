@@ -6,7 +6,7 @@ import { render } from "./render.js";
 import { fillHoles } from "./postfx.js";
 import { denoiseRGBA } from "./denoise.js";
 import { TrimPanel } from "./trim.js";
-import { FrameStore, openVideoSource, openImageSource, isVideoFile, sortImageFiles } from "./frames.js";
+import { FrameStore, openVideoSource, openImageSource, isVideoFile, sortImageFiles, combFraction, isInterlaced, undistortCropRect } from "./frames.js";
 
 const $ = (id) => document.getElementById(id);
 const logEl = $("log");
@@ -119,8 +119,25 @@ function readArgs() {
   const textRects = parseRects("textRects", "text rects");
   const cs = $("canvasScale").value.trim();
   if (cs !== "auto" && !Number.isFinite(parseFloat(cs))) throw new Error("canvas scale は auto か数値");
+  const live = $("liveAction").checked;
+  const sel = (id, dflt) => ($(id).value === "default" ? dflt : $(id).value);
+  const lensRaw = $("lensK1").value.trim();
+  let lensK1 = lensRaw === "" ? (live ? "auto" : "off") : lensRaw;
+  if (lensK1 !== "auto" && lensK1 !== "off") {
+    if (!Number.isFinite(parseFloat(lensK1))) throw new Error("lens k1 は auto / off / 数値");
+    lensK1 = parseFloat(lensK1);
+  }
+  const sharpRaw = $("sharpSigma").value.trim();
   return {
-    model: $("model").value,
+    liveAction: live,
+    model: $("model").value || (live ? "homography" : "scale"),
+    projection: sel("projection", live ? "auto" : "planar"), cylMinSpan: num("cylMinSpan", 35), focal: num("focal", 0),
+    lensK1, quality: sel("quality", live ? "on" : "off"), qualityThr: num("qualityThr", 0.75), qualityWindow: int("qualityWindow", 8), qualityMin: int("qualityMin", 3),
+    sharpSigma: sharpRaw === "" ? (live ? 1.0 : 0) : num("sharpSigma", 0),
+    blendDetect: sel("blendDetect", live ? "on" : "off"), blendThr: num("blendThr", 0.4),
+    deinterlace: sel("deinterlace", live ? "auto" : "off"),
+    exposureRadial: sel("exposureRadial", live ? "on" : "off") === "on",
+    motionReject: sel("motionReject", live ? "on" : "off") === "on",
     pairs: [...new Set($("pairs").value.split(",").map((v) => parseInt(v, 10)).filter((v) => v > 0))].sort((a, b) => a - b),
     minOverlap: num("minOverlap", 0.15), coarseTol: num("coarseTol", 2.0),
     scaleMax: num("scaleMax", 0.06), scaleStep: num("scaleStep", 0.004),
@@ -131,7 +148,8 @@ function readArgs() {
     canvasScale: cs, inlierTol: num("inlierTol", 0.06), sharpTop: num("sharpTop", 0.3), resTol: num("resTol", 1.25),
     anchorFrame: $("anchorFrame").value.trim() === "" ? -1 : int("anchorFrame", -1), anchorWindow: int("anchorWindow", 2),
     stackBudgetMB: int("stackBudget", 128), levelCacheMB: int("levelCache", 768),
-    exposure: $("exposure").value, exposureProfile: $("exposureProfile").checked, exposureMinScore: num("exposureMinScore", 0.2),
+    exposure: $("exposure").value === "auto" && live ? "on" : $("exposure").value,
+    exposureProfile: sel("exposureProfile", live ? "off" : "on") === "on", exposureMinScore: num("exposureMinScore", 0.2),
     exposureLocal: int("exposureLocal", 6), feather: $("feather").value.trim() === "" ? -1 : num("feather", 0),
   };
 }
@@ -259,15 +277,55 @@ async function run() {
     }
     src = isVideo ? await openVideoSource(files[0], opts, log) : await openImageSource(files, opts, log);
     if (src.n < 2) throw new Error("フレームが 2 枚未満です");
+    if (args.liveAction) log(`[live-action] model=${args.model} projection=${args.projection} lens-k1=${args.lensK1} quality=${args.quality} sharp-sigma=${args.sharpSigma} ` +
+                             `blend-detect=${args.blendDetect} deinterlace=${args.deinterlace} exposure=${args.exposure} profile=${args.exposureProfile ? "on" : "off"} ` +
+                             `radial=${args.exposureRadial ? "on" : "off"} motion-reject=${args.motionReject ? "on" : "off"}`);
+    if (args.projection !== "planar" && args.model !== "homography") { log(`[warn] projection ${args.projection} は model=homography のときだけ有効です`); args.projection = "planar"; }
     const plan = planMemory(src.n, src.W, src.H, args);
     store = new FrameStore(gpu, src, { maxResident: plan.maxResident, log });
+    if (args.deinterlace !== "off") {
+      // 櫛状パターンの割合を等間隔の最大 8 フレームで測る（CPU）
+      const idxs = [...new Set(Array.from({ length: Math.min(8, src.n) }, (_, q) => Math.round(q * (src.n - 1) / Math.max(1, Math.min(8, src.n) - 1))))];
+      const cvs = [], chs = [];
+      for (const k of idxs) { const [cv, ch] = combFraction(await src.get(k), src.W, src.H); cvs.push(cv); chs.push(ch); }
+      const cv = median(cvs), ch = median(chs);
+      const doDi = args.deinterlace === "on" || (args.deinterlace === "auto" && isInterlaced(cv, ch));
+      log(`[deinterlace] 櫛状パターンの割合 縦 ${(cv * 100).toFixed(2)}% / 横 ${(ch * 100).toFixed(2)}%（中央値）` + (doDi ? "（インターレースと判断、片フィールド補間します）" : "（プログレッシブ）"));
+      store.deinterlace = doDi;
+    }
+    if (args.lensK1 !== "auto" && args.lensK1 !== "off" && args.lensK1 !== 0) store.setUndistort(args.lensK1);
     rc = new Reconstructor(gpu, src.W, src.H, store, args, log, setProgress);
     await rc.preprocess();
+    if (args.lensK1 === "auto") {
+      const k1 = await rc.searchLensK1();
+      if (k1 !== 0) {
+        // 補正したフレームで前処理をやり直す（フレームは読み直し）
+        rc.destroy(true); rc = null;
+        store.setUndistort(k1);
+        const [ox, oy, ow, oh] = undistortCropRect(src.W, src.H, k1);
+        log(`[lens] k1=${k1.toFixed(4)} で歪み補正（bicubic）` + (ox || oy ? `、有効領域 ${ow}x${oh}（ignore / text rects は補正前の座標のまま）` : ""));
+        if (ox || oy) { args.ignoreRects = args.ignoreRects.map(([x, y, w, h]) => [x - ox, y - oy, w, h]); args.textRects = args.textRects.map(([x, y, w, h]) => [x - ox, y - oy, w, h]); }
+        rc = new Reconstructor(gpu, src.W, src.H, store, args, log, setProgress);
+        await rc.preprocess();
+      }
+    }
     await makeOverlayDebug(rc);
+    if (args.blendDetect === "on") await rc.detectBlendFrames();
     const al = await rc.align();
+    if (args.quality === "on" || args.blendDetect === "on") {
+      await rc.estimateQuality(al);
+      if (args.quality === "on") rc.freeCoarse();
+      const qcsv = rc.qualityCsv(); csvButton("dlQuality", `${outPrefix}quality.csv`, qcsv);
+    }
+    if (al.kind === "cyl") log(`[align] 円筒投影: 焦点距離 ${al.focal.toFixed(1)} px`);
     // CSV
-    let pos = "frame,scale,theta_deg,x,y\n";
-    for (let k = 0; k < rc.n; k++) pos += `${k},${al.S[k].toFixed(5)},${(al.TH[k] * 180 / Math.PI).toFixed(4)},${al.T[k * 2].toFixed(3)},${al.T[k * 2 + 1].toFixed(3)}\n`;
+    let pos = "frame,scale,theta_deg,x,y" + (al.kind === "homography" ? ",h00,h01,h02,h10,h11,h12,h20,h21,h22" : al.kind === "cyl" ? ",yaw_deg,pitch_deg,roll_deg,focal_px" : "") + "\n";
+    for (let k = 0; k < rc.n; k++) {
+      pos += `${k},${al.S[k].toFixed(5)},${(al.TH[k] * 180 / Math.PI).toFixed(4)},${al.T[k * 2].toFixed(3)},${al.T[k * 2 + 1].toFixed(3)}`;
+      if (al.kind === "homography") pos += "," + Array.from(al.Hm[k], (v) => v.toPrecision(7)).join(",");
+      else if (al.kind === "cyl") pos += `,${al.yaw[k].toFixed(4)},${al.pitch[k].toFixed(4)},${(al.TH[k] * 180 / Math.PI).toFixed(4)},${al.focal.toFixed(2)}`;
+      pos += "\n";
+    }
     csvButton("dlPositions", `${outPrefix}positions.csv`, pos);
     let prs = "i,j,scale,theta_deg,tx,ty,score,residual\n";
     al.pairs.forEach(([i, j], k) => {

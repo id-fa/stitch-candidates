@@ -134,7 +134,8 @@ Scoring (scan mode):
 
 `panorama_recon.py` - Recommended tool for video. Replaces the sequential "candidate generation" model with a
 single deterministic answer. Motion model per frame (`--model`): `translation`, `scale` (translation + zoom,
-default), `similarity` (+ rotation). Frame k pixel x maps to canvas X = S[k] R(TH[k]) x + T[k].
+default), `similarity` (+ rotation), `homography` (perspective, for live action; see 実写向け機能 below). Frame k pixel x maps to
+canvas X = S[k] R(TH[k]) x + T[k] (sim models) or X = π(H[k] x) / a cylinder (homography).
 
 ```bash
 # Typical (all frames, GPU auto-detected, zoom handled automatically)
@@ -148,6 +149,9 @@ python panorama_recon.py --frames "frames/*.png" --device cpu --fine-scale 0.5 -
 
 # Pure pan, fastest path (FFT window search instead of Gauss-Newton)
 python panorama_recon.py --video input.mp4 --model translation --out pano_out
+
+# Live-action footage (homography + cylindrical projection, lens distortion, blur/blend-frame rejection, vignetting, motion reject)
+python panorama_recon.py --video handheld.mp4 --live-action --out pano_out
 ```
 
 ### Pipeline
@@ -272,6 +276,40 @@ python panorama_recon.py --video input.mp4 --model translation --out pano_out
   and the profile; `PANORAMA_EXPOSURE_DEBUG=1` also dumps the block observations. Video output with the default (off) is byte-identical
   to before. The Web version implements the same estimator on the CPU (`recon.js` `estimateExposure`, cell statistics from the
   `cell_rgba` kernel) and applies it in the `warp` shader; results match the Python version to ~1 level.
+
+### 実写向け機能（2026-09-18 追加、Python / GUI / Web の 3 つに実装）
+
+`--live-action`（GUI: Live Action 欄の "Live action (実写に特化)" チェック、Web: 「実写に特化」チェック）で下記の既定値をまとめて
+切り替える。各機能は個別オプションでも指定でき（個別指定が優先）、アニメにも使える。**既定（実写オフ）の出力は変更前とバイト一致**
+（sample.mp4 0-40 / sample_image1 / sample3_zoom similarity で Python 版、sample.mp4 40 frames で Web 版を確認済み）。
+実写のサンプル動画が無いので、写真（`sample_image3_photo`）を平面とみなし回転する仮想カメラで撮った合成パン動画
+（露出変動・周辺減光・ノイズ・k1=-0.08 の樽型歪み・ピンボケ 4 枚・モーションブラー 2 枚・ブレンドフレーム 2 枚・通過する動体・途中で止まる動体）
+で検証した（生成スクリプトはセッションのスクラッチにあり、リポジトリには入れていない）。
+
+| 機能 | オプション（Python） | 既定 / `--live-action` 時 | 仕組み |
+|---|---|---|---|
+| 射影変換モデル | `--model homography` | scale / homography | 8 自由度の Gauss-Newton（`gn_refine_h`、正規化座標 `norm_matrix`、J = ∇B·∂W/∂g の規約は `gn_refine` と同じ）。グローバル解 `_solve_global_h` はフレーム j の四隅+中心を H_i⁻¹H_j とペア推定で写した差を **フレーム i の座標で** 測り（フレーム 0 の平面で測ると長いパンで発散）、数値微分 GN + IRLS。Cauchy 尺度は 64→2 px と段階的に絞る（連鎖初期値に外れ値ペアがあると固着するため）。Web: `gnh_*` カーネル（64 スレッド、9x9 正規方程式）、`solveGlobalH` は帯行列 |
+| 投影面 | `--projection auto/planar/cylindrical`, `--cyl-min-span 35`, `--focal` | planar / auto | 焦点距離をペアホモグラフィから推定（`focals_from_homography` = OpenCV の式、中央値）、`_solve_rotations` で回転平均、`Alignment(kind="cyl")` で円筒に投影。auto はパン角 > 35° のとき。回転モデルの残差がホモグラフィの 3 倍超なら「視差あり」と注意 |
+| レンズ歪み | `--lens-k1 auto/off/値` | off / auto | 間隔最大のペア 8 組でホモグラフィ + k1 を同時推定（`gn_refine_hk`: A の画素を歪み除去→G→歪み付与して B をサンプル。A を再標本化しないのでぼけによるバイアスが無い。k1 の微分は数値微分）。ペア間の四分位幅が max(0.02, 0.5\|k1\|) 超か \|k1\| < 0.015 なら 0。採用時は全フレームを bicubic で補正して前処理からやり直す（k1 > 0 は有効矩形に切り出し）。合成 k1=-0.08 → 推定 -0.078。**アニメ sample.mp4 でも -0.036 が一貫して出る**（何らかの放射非線形が本当にある模様。実写モード以外は既定 off なので影響なし） |
+| フレーム品質 | `--quality`, `--quality-thr 0.75`, `--quality-window 8`, `--quality-min-samples 3`, `--sharp-sigma` | off / on, σ=1 | 位置合わせ済みペアの重なりで鮮明度マップ（1/4）の平均の比 log(s_j/s_i) を観測し、フレームごとの log 鮮明度を IRLS で解く（`estimate_quality`。同じ被写体で比べるので内容に依らない。拡大率差 5% 超のペアは除外）。近傍 ±8 の中央値より 0.75 倍未満 → 段階 1。`--sharp-sigma 1` は鮮明度を測る前のぼかし（ノイズ / 粒子を鮮明さと誤認しない。`recon_sharp` にも効く）。合成では、画素ごとに段階 0 だけで 3 標本以上あればそれだけ、無ければ段階 ≤1、それも無ければ全部（被覆を犠牲にしない）。合成テスト: ピンボケ 4 枚・ブラー 2 枚を全て検出（比 0.29-0.55） |
+| ブレンドフレーム | `--blend-detect`, `--blend-thr 0.4` | off / on | フレームレート変換で前後 2 枚が **位置合わせなしに** 混ざった二重像。粗レベルハイパスで hp_k ≈ α a + (1-α) b を当てはめ、残差 ρ = \|hp_k - fit\| / (\|a-b\|/2) < 0.4 かつ 0.15 < α < 0.85 で段階 2（`detect_blend_frames`、位置合わせの前）。通常のフレームは ρ ≈ 1.2-1.9、ブレンドは 0.09-0.13。そのフレームを含むペアは重み ×1e-3、連鎖の解には跨ぐ k=2 ペアを入れる（切れないように）。位置は前後の良いフレームから補間（`_interp_bad_frames`。ゴミのペアだけで決まると暴走してパン角とキャンバスを汚す） |
+| 位置合わせ失敗フレーム | （homography 時は自動） | — | 全ペアの残差中央値 > 20 px のフレームは段階 2 にして補間。フレーム 0 が該当すれば基準を最初の良いフレームに変更（`Hk ← H_ref⁻¹ Hk`。フレーム 0 のペアに重みが無いと他のフレームが任意の射影変換だけ自由に動く） |
+| デインターレース | `--deinterlace auto/on/off` | off / auto | `comb_fraction`: 4 行にわたり明暗が交互になる画素の比率を縦と横で測り、縦 > 1% かつ縦 > 3×横 でインターレース（テクスチャの横線や横ブラーの誤検出を避けるため横と比較する。合成の進行素材で縦 1.8-2.5% / 横 1.3-1.9%、織り合わせた偽インターレースで 11% / 2.2%）。片フィールド線形補間 |
+| 周辺減光 | `--exposure-radial`, `--exposure-profile` | off, profile on / on, profile off | 露出モデルに全フレーム共通の **乗算** 放射プロファイル 1+v(r)（`RAD_KNOTS`、r は中心 0 隅 1、v(0)=0 で固定）を追加。実写では画面固定の加算プロファイル（プレイヤーのグラデーション用）を既定 off にし、代わりに放射項を使う（両方あると縮退して加算側が減光を吸う）。`--exposure` は実写では動画でも on |
+| 動体クラスタ | `--motion-reject` | off / on | 画素ごとに、中央値から外れた標本が第 2 のまとまり（≥3 かつ ≥30%、その中央値から tol 内が 70% 超）を作るとき、**時間的に広く散らばっている方**（スロット範囲が 1.2 倍超）を背景として選ぶ。ゆっくり通過する動体（同じ画素を 25/60 フレーム覆う）は消える。**途中で止まって最後まで残る物は判定できない**（背景と区別する根拠が無い。`--anchor-frame` で対処）。同時に第 1 クラスタだけの中央値に取り直す（少数派の動体が 20-40% あると全体の中央値が背景クラスタの端に寄って数階調ずれ、通過した帯が見える） |
+| 診断 | pairs.csv `outlier_pct` | — | GN 最終レベルで \|r\| > 3 MAD の画素比率。中央値 > 10% で「動体 / 視差」の注意（アニメのキャラ動画で 12% 程度出る） |
+
+出力: `quality.csv`（frame, log_sharp, ratio_to_local, blend_rho, blend_alpha, tier）、positions.csv は homography で h00..h22、cyl で yaw/pitch/roll/focal_px を追加。
+Web 版: `#liveAction` チェック、「実写向け」fieldset（default = チェックに従う）、quality.csv ボタン。`frames.js` の `FrameStore` が読み込み時に
+デインターレース（CPU）と歪み補正（`undistort_rgba`、k1>0 は有効矩形を左上詰め = パディング扱い）を行い、k1 採用時は常駐フレームを破棄して
+`Reconstructor` を作り直す。露出推定の CPU ソルバーは未知数を [局所場（帯）, 共通項（密）] に並べ替えて `solveArrowhead` で解く
+（100 フレーム × 6x3 格子で密行列 163 s → 2 s、結果は同一）。Web と Python の結果: 合成動画で k1 -0.0764 / -0.0762、焦点距離 649.4 / 649.4、
+キャンバス 1319x565 / 1316x565、median 画像の差の中央値 1 階調。
+
+注意:
+- 実写モードをアニメに使うと、射影変換がアニメの非剛体な動きに合わず台形の歪みが累積する（azurbisoku で確認）。アニメは既定モードで使う。
+- 円筒投影の焦点距離推定は歪みが残っていると偏る（合成 80° パンで k1=-0.05 の素材: 推定 744 vs 真値 650、パン角 69° vs 80°。残差は 0.15 px で結果自体は整合）。`--focal` で指定できる。
+- Chrome は mp4v（MPEG-4 part 2）を再生できないので Web 版のテストは H.264 に変換して行う。
 
 ---
 

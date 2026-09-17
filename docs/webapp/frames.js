@@ -30,6 +30,99 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 }`,
 };
 
+// 放射歪み補正（shaders_img.js の undistort_rgba と同じ式）。frames.js 単体で使えるようここにも置く
+const UNDISTORT = {
+  fields: [["W", "u32"], ["H", "u32"], ["k1", "f32"], ["ox", "u32"], ["oy", "u32"], ["ow", "u32"], ["oh", "u32"]],
+  bindings: ["r", "rw"], wg: [16, 16, 1],
+  code: /* wgsl */ `
+struct P { W: u32, H: u32, k1: f32, ox: u32, oy: u32, ow: u32, oh: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> src: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+fn rgba_of(c: u32) -> vec4<f32> { return vec4<f32>(f32(c & 255u), f32((c >> 8u) & 255u), f32((c >> 16u) & 255u), f32(c >> 24u)); }
+fn cubw(t: f32) -> vec4<f32> {
+  let t2 = t * t; let t3 = t2 * t;
+  return vec4<f32>(-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2);
+}
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let x = g.x; let y = g.y;
+  if (x >= p.W || y >= p.H) { return; }
+  let W = i32(p.W); let H = i32(p.H);
+  let xu = f32(min(x, p.ow - 1u) + p.ox); let yu = f32(min(y, p.oh - 1u) + p.oy);
+  let cx = 0.5 * f32(W - 1); let cy = 0.5 * f32(H - 1);
+  let rn2 = cx * cx + cy * cy;
+  let ux = xu - cx; let uy = yu - cy;
+  let fct = 1.0 + p.k1 * (ux * ux + uy * uy) / rn2;
+  let xd = cx + ux * fct; let yd = cy + uy * fct;
+  let x0f = floor(xd); let y0f = floor(yd);
+  let wx = cubw(xd - x0f); let wy = cubw(yd - y0f);
+  var acc = vec4<f32>(0.0); var wsum = 0.0;
+  for (var j = -1; j <= 2; j++) {
+    let yy = clamp(i32(y0f) + j, 0, H - 1);
+    for (var i = -1; i <= 2; i++) {
+      let xx = clamp(i32(x0f) + i, 0, W - 1);
+      let w = wx[i + 1] * wy[j + 1];
+      acc += w * rgba_of(src[yy * W + xx]); wsum += w;
+    }
+  }
+  acc = acc / max(wsum, 1e-6);
+  let an = rgba_of(src[clamp(i32(round(yd)), 0, H - 1) * W + clamp(i32(round(xd)), 0, W - 1)]).w;
+  let r = u32(clamp(acc.x + 0.5, 0.0, 255.0)); let gg = u32(clamp(acc.y + 0.5, 0.0, 255.0)); let b = u32(clamp(acc.z + 0.5, 0.0, 255.0));
+  dst[y * p.W + x] = r | (gg << 8u) | (b << 16u) | (u32(an) << 24u);
+}`,
+};
+
+/** k1 > 0（糸巻き）では隅が範囲外になるので、全画素が有効な中央の矩形 [x, y, w, h] を返す。k1 <= 0 なら全体 */
+export function undistortCropRect(W, H, k1) {
+  if (k1 <= 0) return [0, 0, W, H];
+  const cx = 0.5 * (W - 1), cy = 0.5 * (H - 1), rn2 = cx * cx + cy * cy;
+  let t = 1.0;
+  for (let it = 0; it < 200; it++) {
+    const hx = t * cx, hy = t * cy, r2 = (hx * hx + hy * hy) / rn2;
+    if (hx * (1 + k1 * r2) <= cx && hy * (1 + k1 * r2) <= cy) break;
+    t -= 0.005;
+  }
+  const x0 = Math.ceil(cx - t * cx), y0 = Math.ceil(cy - t * cy);
+  return [x0, y0, W - 2 * x0, H - 2 * y0];
+}
+
+/** トップフィールド（偶数行）を残し、奇数行を上下の偶数行の平均で補間する（RGBA、破壊的） */
+export function deinterlaceRGBA(rgba, W, H) {
+  const row = W * 4;
+  for (let y = 1; y < H; y += 2) {
+    const yp = y - 1, yn = y + 1 < H ? y + 1 : y - 1;
+    const o = y * row, op = yp * row, on = yn * row;
+    for (let i = 0; i < row; i++) rgba[o + i] = (rgba[op + i] + rgba[on + i] + 1) >> 1;
+  }
+  return rgba;
+}
+
+/**
+ * インターレースの櫛状パターンの割合 [縦, 横]（Python 版 comb_fraction と同じ）: 4 行にわたって明暗が交互になる画素の比率を
+ * 縦方向と横方向で。プログレッシブなら縦 ≈ 横、インターレースの動きのある部分では縦 ≫ 横
+ */
+export function combFraction(rgba, W, H, thr = 10) {
+  const g = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) g[i] = 0.299 * rgba[i * 4] + 0.587 * rgba[i * 4 + 1] + 0.114 * rgba[i * 4 + 2];
+  const t2 = thr * thr;
+  let cv = 0, ch = 0;
+  for (let y = 1; y + 2 < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    const c0 = (g[i - W] - g[i]) * (g[i + W] - g[i]) > t2;
+    const c1 = (g[i] - g[i + W]) * (g[i + 2 * W] - g[i + W]) > t2;
+    if (c0 && c1) cv++;
+  }
+  for (let y = 0; y < H; y++) for (let x = 1; x + 2 < W; x++) {
+    const i = y * W + x;
+    const c0 = (g[i - 1] - g[i]) * (g[i + 1] - g[i]) > t2;
+    const c1 = (g[i] - g[i + 1]) * (g[i + 2] - g[i + 1]) > t2;
+    if (c0 && c1) ch++;
+  }
+  return [cv / (W * H), ch / (W * H)];
+}
+export const isInterlaced = (cv, ch) => cv > 0.01 && cv > 3.0 * ch;
+
 const UNPACK_MASK = {
   fields: [["n", "u32"]], bindings: ["r", "rw"], wg: [256, 1, 1],
   code: /* wgsl */ `
@@ -68,6 +161,34 @@ export class FrameStore {
     this.decodes = 0; this.evictions = 0;
     this.kPack = gpu.kernel("pack_mask", PACK_MASK.code, PACK_MASK.fields, PACK_MASK.bindings, PACK_MASK.wg);
     this.kUnpack = gpu.kernel("unpack_mask", UNPACK_MASK.code, UNPACK_MASK.fields, UNPACK_MASK.bindings, UNPACK_MASK.wg);
+    this.kUndistort = gpu.kernel("undistort_rgba", UNDISTORT.code, UNDISTORT.fields, UNDISTORT.bindings, UNDISTORT.wg);
+    this.deinterlace = false;   // 読み込み時に片フィールド補間する（CPU）
+    this.k1 = 0;                // 放射歪み係数（0 以外なら読み込み時に GPU で補正し、有効矩形を左上詰めにする）
+    this.cropRect = null;
+    this._tmp = null;
+  }
+
+  /**
+   * 放射歪み補正を設定する。常駐フレームとパック済みマスクは（補正前のものなので）破棄し、以後の get() で補正して読み直す。
+   * k1 > 0 では有効矩形が縮むので sizes を更新する（パディングされたフレームと同じ扱いになる）
+   */
+  setUndistort(k1) {
+    this.k1 = k1;
+    this.cropRect = undistortCropRect(this.W, this.H, k1);
+    const [, , w, h] = this.cropRect;
+    for (let k = 0; k < this.n; k++) this.sizes[k] = [Math.min(this.sizes[k][0], w), Math.min(this.sizes[k][1], h)];
+    this.reset();
+  }
+
+  /** 常駐フレームとマスクを全て破棄する（前処理をやり直すとき） */
+  reset() {
+    this.gpu.submit();
+    for (let k = 0; k < this.n; k++) {
+      if (this.bufs[k]) { this.gpu.free(this.bufs[k]); this.bufs[k] = null; }
+      if (this.masks[k]) { this.gpu.free(this.masks[k]); this.masks[k] = null; }
+      this.maskReady[k] = 0;
+    }
+    this.resident = 0; this.pinned.clear();
   }
 
   /** 全フレームを常駐できる（破棄が起きない）なら true */
@@ -87,8 +208,16 @@ export class FrameStore {
       this._makeRoom(1);
       const rgba = await this.src.get(k);
       this.decodes++;
+      if (this.deinterlace) deinterlaceRGBA(rgba, this.W, this.H);
       b = this.gpu.buf(this.frameBytes, `frame${k}`);
-      this.gpu.upload(b, rgba);
+      if (this.k1 !== 0) {
+        if (!this._tmp) this._tmp = this.gpu.buf(this.frameBytes, "undistort_tmp");
+        this.gpu.upload(this._tmp, rgba);
+        const [ox, oy, ow, oh] = this.cropRect;
+        this.kUndistort.run2d({ W: this.W, H: this.H, k1: this.k1, ox, oy, ow, oh }, [this._tmp, b], this.W, this.H);
+      } else {
+        this.gpu.upload(b, rgba);
+      }
       if (this.maskReady[k]) this.kUnpack.run({ n: this.W * this.H }, [this.masks[k], b], Math.ceil(this.W * this.H / 256));
       this.bufs[k] = b; this.resident++;
     }
@@ -150,6 +279,7 @@ export class FrameStore {
       if (this.bufs[k]) { this.gpu.free(this.bufs[k]); this.bufs[k] = null; }
       if (this.masks[k]) { this.gpu.free(this.masks[k]); this.masks[k] = null; }
     }
+    if (this._tmp) { this.gpu.free(this._tmp); this._tmp = null; }
     this.resident = 0; this.pinned.clear();
   }
 }

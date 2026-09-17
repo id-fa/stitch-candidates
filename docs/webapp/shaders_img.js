@@ -372,3 +372,141 @@ fn main(@builtin(local_invocation_id) l: vec3<u32>) {
   if (l.x == 0u) { dst[p.out_off] = sh[0]; }
 }`,
 };
+
+// ------------------------------------------------------------ 実写向け: レンズ歪み補正、ブレンドフレーム統計、鮮明度比較
+// RGBA フレームの放射歪み補正（bicubic, Catmull-Rom）。x_d = c + (x_u - c)(1 + k1 r_u²)、r_u = |x_u - c| / 半対角。
+// 出力は有効矩形 (ox, oy, ow, oh) を左上詰めで書き、残り（右・下）は端の画素を複製する（パディングされたフレームと同じ扱い）。
+// alpha はそのまま近傍から引く（クリーンフラグは補正前のものが入っている想定なので、前処理より前に呼ぶ）
+IMG.undistort_rgba = {
+  fields: [["W", "u32"], ["H", "u32"], ["k1", "f32"], ["ox", "u32"], ["oy", "u32"], ["ow", "u32"], ["oh", "u32"]],
+  bindings: ["r", "rw"], wg: [16, 16, 1],
+  code: /* wgsl */ `
+struct P { W: u32, H: u32, k1: f32, ox: u32, oy: u32, ow: u32, oh: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> src: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+fn rgba_of(c: u32) -> vec4<f32> { return vec4<f32>(f32(c & 255u), f32((c >> 8u) & 255u), f32((c >> 16u) & 255u), f32(c >> 24u)); }
+fn cubw(t: f32) -> vec4<f32> {
+  // Catmull-Rom (a = -0.5)
+  let t2 = t * t; let t3 = t2 * t;
+  return vec4<f32>(-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2);
+}
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let x = g.x; let y = g.y;
+  if (x >= p.W || y >= p.H) { return; }
+  let W = i32(p.W); let H = i32(p.H);
+  // 出力画素 (x, y) は有効矩形内の (min(x, ow-1), min(y, oh-1)) の値（右・下は複製）
+  let xu = f32(min(x, p.ow - 1u) + p.ox); let yu = f32(min(y, p.oh - 1u) + p.oy);
+  let cx = 0.5 * f32(W - 1); let cy = 0.5 * f32(H - 1);
+  let rn2 = cx * cx + cy * cy;
+  let ux = xu - cx; let uy = yu - cy;
+  let fct = 1.0 + p.k1 * (ux * ux + uy * uy) / rn2;
+  let xd = cx + ux * fct; let yd = cy + uy * fct;
+  let x0f = floor(xd); let y0f = floor(yd);
+  let fx = xd - x0f; let fy = yd - y0f;
+  let wx = cubw(fx); let wy = cubw(fy);
+  var acc = vec4<f32>(0.0);
+  var wsum = 0.0;
+  for (var j = -1; j <= 2; j++) {
+    let yy = clamp(i32(y0f) + j, 0, H - 1);
+    for (var i = -1; i <= 2; i++) {
+      let xx = clamp(i32(x0f) + i, 0, W - 1);
+      let w = wx[i + 1] * wy[j + 1];
+      acc += w * rgba_of(src[yy * W + xx]); wsum += w;
+    }
+  }
+  acc = acc / max(wsum, 1e-6);
+  // alpha は最近傍
+  let an = rgba_of(src[clamp(i32(round(yd)), 0, H - 1) * W + clamp(i32(round(xd)), 0, W - 1)]).w;
+  let r = u32(clamp(acc.x + 0.5, 0.0, 255.0)); let gg = u32(clamp(acc.y + 0.5, 0.0, 255.0)); let b = u32(clamp(acc.z + 0.5, 0.0, 255.0));
+  dst[y * p.W + x] = r | (gg << 8u) | (b << 16u) | (u32(an) << 24u);
+}`,
+};
+
+// 3 つのレベル画像 (a, c, b) の共通有効画素で 2 次モーメントを集計（ブレンドフレーム判定用）:
+//   out[wg*8 + q] = (n, Σa, Σb, Σc, Σab, Σac, Σbc, Σaa), out[wg*8 + 8..] 続き (Σbb, Σcc) → 10 個
+IMG.moments3 = {
+  fields: [["n", "u32"], ["nwg", "u32"]],
+  bindings: ["r", "r", "r", "rw"], wg: [256, 1, 1],
+  code: /* wgsl */ `
+struct P { n: u32, nwg: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> A: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> C: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read> B: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read_write> outp: array<f32>;
+var<workgroup> red: array<f32, 2560>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+  var acc: array<f32, 10>;
+  for (var q = 0u; q < 10u; q++) { acc[q] = 0.0; }
+  let stride = p.nwg * 256u;
+  for (var i = g.x; i < p.n; i += stride) {
+    let a = A[i]; let c = C[i]; let b = B[i];
+    if (a.y <= 0.5 || b.y <= 0.5 || c.y <= 0.5) { continue; }
+    acc[0] += 1.0; acc[1] += a.x; acc[2] += b.x; acc[3] += c.x; acc[4] += a.x * b.x; acc[5] += a.x * c.x; acc[6] += b.x * c.x;
+    acc[7] += a.x * a.x; acc[8] += b.x * b.x; acc[9] += c.x * c.x;
+  }
+  for (var q = 0u; q < 10u; q++) { red[l.x * 10u + q] = acc[q]; }
+  workgroupBarrier();
+  for (var st = 128u; st > 0u; st >>= 1u) {
+    if (l.x < st) { for (var q = 0u; q < 10u; q++) { red[l.x * 10u + q] += red[(l.x + st) * 10u + q]; } }
+    workgroupBarrier();
+  }
+  if (l.x == 0u) { for (var q = 0u; q < 10u; q++) { outp[wid.x * 10u + q] = red[q]; } }
+}`,
+};
+
+// フレーム i の 1/4 鮮明度マップと、3x3 行列 M（フレーム i の画素 → フレーム j の画素）で引いたフレーム j の鮮明度を、
+// 両方の有効領域（1/4 レベル画像 C4 の valid をサンプル）で集計: out[wg*4 + q] = (n, Σ s_i, Σ s_j, 0)
+IMG.quality_pair = {
+  fields: [["Wq", "u32"], ["Hq", "u32"], ["W", "u32"], ["H", "u32"], ["wc", "u32"], ["hc", "u32"], ["off_i", "u32"], ["off_j", "u32"], ["nwg", "u32"],
+           ["m0", "vec4f"], ["m1", "vec4f"], ["m2", "vec4f"]],
+  bindings: ["r", "r", "r", "rw"], wg: [256, 1, 1],
+  code: /* wgsl */ `
+struct P { Wq: u32, Hq: u32, W: u32, H: u32, wc: u32, hc: u32, off_i: u32, off_j: u32, nwg: u32, m0: vec4<f32>, m1: vec4<f32>, m2: vec4<f32> }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> sharpq: array<f32>;
+@group(0) @binding(2) var<storage, read> Ci: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read> Cj: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read_write> outp: array<f32>;
+var<workgroup> red: array<f32, 1024>;
+fn valid_c(C: ptr<storage, array<vec2<f32>>, read>, X: f32, Y: f32) -> bool {
+  // フル解像度画素 (X, Y) → 粗レベル座標（最近傍）
+  let u = i32(round((X + 0.5) * f32(p.wc) / f32(p.W) - 0.5)); let v = i32(round((Y + 0.5) * f32(p.hc) / f32(p.H) - 0.5));
+  if (u < 0 || u >= i32(p.wc) || v < 0 || v >= i32(p.hc)) { return false; }
+  return (*C)[v * i32(p.wc) + u].y > 0.5;
+}
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+  var n = 0.0; var si = 0.0; var sj = 0.0;
+  let stride = p.nwg * 256u;
+  let total = p.Wq * p.Hq;
+  for (var i = g.x; i < total; i += stride) {
+    let qx = f32(i % p.Wq); let qy = f32(i / p.Wq);
+    let X = (qx + 0.5) * f32(p.W) / f32(p.Wq) - 0.5; let Y = (qy + 0.5) * f32(p.H) / f32(p.Hq) - 0.5;
+    if (!valid_c(&Ci, X, Y)) { continue; }
+    let z = p.m2.x * X + p.m2.y * Y + p.m2.z;
+    if (z <= 1e-6) { continue; }
+    let Xj = (p.m0.x * X + p.m0.y * Y + p.m0.z) / z; let Yj = (p.m1.x * X + p.m1.y * Y + p.m1.z) / z;
+    if (Xj < 0.0 || Xj > f32(p.W - 1u) || Yj < 0.0 || Yj > f32(p.H - 1u)) { continue; }
+    if (!valid_c(&Cj, Xj, Yj)) { continue; }
+    let uj = clamp((Xj + 0.5) * f32(p.Wq) / f32(p.W) - 0.5, 0.0, f32(p.Wq - 1u));
+    let vj = clamp((Yj + 0.5) * f32(p.Hq) / f32(p.H) - 0.5, 0.0, f32(p.Hq - 1u));
+    let u0 = u32(floor(uj)); let v0 = u32(floor(vj));
+    let u1 = min(u0 + 1u, p.Wq - 1u); let v1 = min(v0 + 1u, p.Hq - 1u);
+    let fu = uj - f32(u0); let fv = vj - f32(v0);
+    let s = sharpq[p.off_j + v0 * p.Wq + u0] * (1.0 - fu) * (1.0 - fv) + sharpq[p.off_j + v0 * p.Wq + u1] * fu * (1.0 - fv)
+          + sharpq[p.off_j + v1 * p.Wq + u0] * (1.0 - fu) * fv + sharpq[p.off_j + v1 * p.Wq + u1] * fu * fv;
+    n += 1.0; si += sharpq[p.off_i + i]; sj += s;
+  }
+  red[l.x * 4u] = n; red[l.x * 4u + 1u] = si; red[l.x * 4u + 2u] = sj; red[l.x * 4u + 3u] = 0.0;
+  workgroupBarrier();
+  for (var st = 128u; st > 0u; st >>= 1u) {
+    if (l.x < st) { for (var q = 0u; q < 4u; q++) { red[l.x * 4u + q] += red[(l.x + st) * 4u + q]; } }
+    workgroupBarrier();
+  }
+  if (l.x == 0u) { for (var q = 0u; q < 4u; q++) { outp[wid.x * 4u + q] = red[q]; } }
+}`,
+};
