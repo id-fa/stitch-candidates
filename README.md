@@ -88,6 +88,9 @@ python panorama_recon.py --frames "frames/*.png" --fps 10 --out pano_out
 
 GUI: `python gui.py` → **Panorama Reconstruct** タブ
 
+WebGPU 版（ブラウザで動作、torch / CUDA 不要） / Browser version (WebGPU, no torch / CUDA required):
+https://id-fa.github.io/stitch-candidates/webapp/
+
 ---
 
 ## 基本的な使い方 / Basic Usage
